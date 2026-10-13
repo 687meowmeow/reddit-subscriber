@@ -7,23 +7,40 @@ import fsSync from "fs";
 // ============================================================
 // Read config from .config.json
 // ============================================================
-async function getConfig(): Promise<{ csvRoot: string; pythonCmd: string }> {
+async function getConfig(): Promise<{
+  csvRoot: string;
+  pythonCmd: string;
+  redditUsername?: string;
+  redditPassword?: string;
+}> {
   const configFile = path.join(process.cwd(), ".config.json");
   try {
     const data = await fs.readFile(configFile, "utf-8");
-    return JSON.parse(data);
+    const config = JSON.parse(data);
+    return {
+      csvRoot: config.csvRoot || "",
+      pythonCmd: config.pythonCmd || (process.platform === "win32" ? "python" : "python3"),
+      redditUsername: config.redditUsername,
+      redditPassword: config.redditPassword,
+    };
   } catch {
     // Auto-detect
     let current = process.cwd();
     for (let i = 0; i < 10; i++) {
       if (fsSync.existsSync(path.join(current, "reddit_browser_subscriber.py"))) {
-        return { csvRoot: current, pythonCmd: process.platform === "win32" ? "python" : "python3" };
+        return {
+          csvRoot: current,
+          pythonCmd: process.platform === "win32" ? "python" : "python3",
+        };
       }
       const parent = path.dirname(current);
       if (parent === current) break;
       current = parent;
     }
-    return { csvRoot: path.resolve(process.cwd(), ".."), pythonCmd: process.platform === "win32" ? "python" : "python3" };
+    return {
+      csvRoot: path.resolve(process.cwd(), ".."),
+      pythonCmd: process.platform === "win32" ? "python" : "python3",
+    };
   }
 }
 
@@ -131,13 +148,21 @@ export async function POST(request: NextRequest) {
       ...process.env,
       PYTHONUNBUFFERED: "1",
       PYTHONIOENCODING: "utf-8",
+      // Tell the Python script where the pause-flag file lives so it can
+      // check for it between rows and pause when a GitHub update is applying.
+      PAUSE_FLAG_FILE: path.join(csvRoot, ".update-pause-flag"),
     };
-    if (body.redditUsername) childEnv.REDDIT_USERNAME = body.redditUsername;
-    if (body.redditPassword) childEnv.REDDIT_PASSWORD = body.redditPassword;
+    // Use credentials from the request body if provided, otherwise fall back
+    // to stored credentials from .config.json (so the user doesn't have to
+    // re-enter them every time).
+    const redditUsername = body.redditUsername || config.redditUsername || "";
+    const redditPassword = body.redditPassword || config.redditPassword || "";
+    if (redditUsername) childEnv.REDDIT_USERNAME = redditUsername;
+    if (redditPassword) childEnv.REDDIT_PASSWORD = redditPassword;
 
     addLog("stderr", `[dashboard] Starting: ${pyCmd} ${args.join(" ")}`);
-    if (body.redditUsername) {
-      addLog("stderr", `[dashboard] Auto-login enabled for user: ${body.redditUsername}`);
+    if (redditUsername) {
+      addLog("stderr", `[dashboard] Auto-login enabled for user: ${redditUsername}`);
     }
 
     runState.logs = [];

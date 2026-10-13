@@ -1610,10 +1610,51 @@ function RunControls({
   const [redditUsername, setRedditUsername] = useState("");
   const [redditPassword, setRedditPassword] = useState("");
   const [showPassword, setShowPassword] = useState(false);
+  const [credentialsSaved, setCredentialsSaved] = useState(false);
+  const [savingCredentials, setSavingCredentials] = useState(false);
   const logEndRef = useRef<HTMLDivElement>(null);
   // Use a ref for lastLogIdx to avoid race conditions where the interval
   // fires before setLastLogIdx takes effect, causing duplicate log lines.
   const lastLogIdxRef = useRef(0);
+
+  // Load stored Reddit credentials from the server on mount
+  // so the user doesn't have to re-enter them every time.
+  useEffect(() => {
+    fetch("/api/settings")
+      .then((res) => res.json())
+      .then((data) => {
+        if (data?.config) {
+          if (data.config.redditUsername) setRedditUsername(data.config.redditUsername);
+          // The password comes back masked (e.g. "x•••x"). We set it as
+          // the input value so the field shows dots. When the user clicks
+          // Start, the run API will use the stored (unmasked) password
+          // from .config.json since the masked value contains "•".
+          if (data.config.redditPassword) {
+            setRedditPassword(data.config.redditPassword);
+            setCredentialsSaved(true);
+          }
+        }
+      })
+      .catch(() => {});
+  }, []);
+
+  // Save credentials to the server
+  const saveCredentials = useCallback(async () => {
+    setSavingCredentials(true);
+    try {
+      await fetch("/api/settings", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          redditUsername: redditUsername,
+          redditPassword: redditPassword.includes("•") ? undefined : redditPassword,
+        }),
+      });
+      setCredentialsSaved(true);
+    } catch {} finally {
+      setSavingCredentials(false);
+    }
+  }, [redditUsername, redditPassword]);
 
   // Poll run status
   useEffect(() => {
@@ -1852,7 +1893,10 @@ function RunControls({
               type="text"
               placeholder="Reddit username"
               value={redditUsername}
-              onChange={(e) => setRedditUsername(e.target.value)}
+              onChange={(e) => {
+                setRedditUsername(e.target.value);
+                setCredentialsSaved(false);
+              }}
               className="w-36 h-8 text-xs"
               disabled={isRunning}
             />
@@ -1861,7 +1905,10 @@ function RunControls({
                 type={showPassword ? "text" : "password"}
                 placeholder="Password"
                 value={redditPassword}
-                onChange={(e) => setRedditPassword(e.target.value)}
+                onChange={(e) => {
+                  setRedditPassword(e.target.value);
+                  setCredentialsSaved(false);
+                }}
                 className="w-32 h-8 text-xs pr-7"
                 disabled={isRunning}
               />
@@ -1878,6 +1925,21 @@ function RunControls({
                 )}
               </button>
             </div>
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={saveCredentials}
+              disabled={savingCredentials || isRunning || (!redditUsername && !redditPassword)}
+              className="h-8 text-xs gap-1"
+              title="Save credentials on the server so you don't have to re-enter them"
+            >
+              {savingCredentials ? (
+                <Loader2 className="w-3 h-3 animate-spin" />
+              ) : credentialsSaved ? (
+                <CheckCircle2 className="w-3 h-3 text-emerald-500" />
+              ) : null}
+              {credentialsSaved ? "Saved" : "Save"}
+            </Button>
             {redditUsername && redditPassword && (
               <Badge variant="outline" className="text-[10px] py-0 px-1.5 border-emerald-300 text-emerald-700 dark:border-emerald-700 dark:text-emerald-300">
                 Auto-login

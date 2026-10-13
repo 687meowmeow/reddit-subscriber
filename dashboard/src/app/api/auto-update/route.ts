@@ -221,6 +221,18 @@ export async function GET() {
     const changedFiles = await getChangedFiles(cwd, oldCommit || "HEAD", newCommit);
     const commitLog = await getCommitLog(cwd, oldCommit || "HEAD", newCommit);
 
+    // --- PAUSE FLAG ---
+    // Create a pause-flag file so the running Python subscriber knows to
+    // stop processing new rows while we apply the update. The subscriber
+    // checks for this file at the start of each row iteration.
+    const pauseFlagPath = path.join(cwd, ".update-pause-flag");
+    try {
+      await fs.writeFile(pauseFlagPath, "paused", "utf-8");
+      // Give the subscriber a moment to notice the flag and finish any
+      // in-progress page load before we start modifying files.
+      await new Promise((resolve) => setTimeout(resolve, 3000));
+    } catch {}
+
     // Use `git reset --hard origin/<branch>` instead of `git pull`.
     // This discards any local changes to TRACKED files (like start.sh)
     // that the user may have edited, but PRESERVES all UNTRACKED files
@@ -234,6 +246,8 @@ export async function GET() {
         GIT_TERMINAL_PROMPT: "0",
       });
     } catch (err: any) {
+      // Remove the pause flag even on error so the subscriber can continue
+      try { await fs.unlink(pauseFlagPath); } catch {}
       return NextResponse.json({
         enabled: true,
         isGitRepo: true,
@@ -252,6 +266,10 @@ export async function GET() {
     if (changedFiles.includes("requirements.txt")) {
       pythonDepsInstalled = await installPythonDeps(cwd, config.pythonCmd);
     }
+
+    // --- REMOVE PAUSE FLAG ---
+    // The update is done — let the subscriber resume processing.
+    try { await fs.unlink(pauseFlagPath); } catch {}
 
     const pythonScriptChanged = changedFiles.includes("reddit_browser_subscriber.py");
     const nextConfigChanged = changedFiles.some(

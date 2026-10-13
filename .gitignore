@@ -23,8 +23,11 @@ venv/
 # Dashboard runtime config (paths differ per machine)
 dashboard/.config.json
 
-# ALL CSV files — these are user data, not source code.
-# Includes both input CSVs (subreddits.csv) and status CSVs
-# (subreddits.status.csv with subscription progress).
-# Users import their own CSVs via the dashboard UI.
+# Status files (per-machine, regenerated)
+*.status.csv
+
+# ALL CSV files — user data, not source code
 *.csv
+
+# Pause flag file (created by auto-update during updates)
+.update-pause-flag

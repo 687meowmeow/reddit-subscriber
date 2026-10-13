@@ -21,6 +21,8 @@ interface Config {
   githubRepo?: string;
   githubPat?: string;
   autoUpdate?: boolean;
+  redditUsername?: string;
+  redditPassword?: string;
 }
 
 async function readConfig(): Promise<Config> {
@@ -62,6 +64,13 @@ function maskPat(pat?: string): string {
   return pat.slice(0, 4) + "..." + pat.slice(-4);
 }
 
+// Mask the Reddit password in API responses — show first char + dots
+function maskPassword(pwd?: string): string {
+  if (!pwd) return "";
+  if (pwd.length < 4) return "*";
+  return pwd[0] + "•".repeat(Math.max(pwd.length - 2, 3)) + pwd[pwd.length - 1];
+}
+
 export async function GET() {
   let config = await readConfig();
 
@@ -97,6 +106,7 @@ export async function GET() {
     config: {
       ...config,
       githubPat: maskPat(config.githubPat), // never send full PAT to client
+      redditPassword: maskPassword(config.redditPassword), // never send full password
     },
     detected: {
       csvRoot: autoDetectRoot(),
@@ -141,6 +151,20 @@ export async function POST(request: NextRequest) {
   if (body.autoUpdate !== undefined) {
     config.autoUpdate = Boolean(body.autoUpdate);
   }
+  if (body.redditUsername !== undefined) {
+    config.redditUsername = body.redditUsername;
+  }
+  // For Reddit password: same masking logic as the PAT.
+  // Empty string = clear it; "x•••x" = leave unchanged; otherwise = update.
+  if (body.redditPassword !== undefined) {
+    if (body.redditPassword === "") {
+      config.redditPassword = "";
+    } else if (body.redditPassword.includes("•")) {
+      // masked value returned from GET — don't overwrite the real one
+    } else {
+      config.redditPassword = body.redditPassword;
+    }
+  }
 
   await writeConfig(config);
 
@@ -163,6 +187,7 @@ export async function POST(request: NextRequest) {
     config: {
       ...config,
       githubPat: maskPat(config.githubPat),
+      redditPassword: maskPassword(config.redditPassword),
     },
     status: { dirExists, csvCount, csvFiles },
   });

@@ -89,6 +89,7 @@ import logging
 import os
 import random
 import re
+import socket
 import sys
 import tempfile
 import time
@@ -97,6 +98,7 @@ import urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
+from urllib.request import urlopen
 
 # -------------------------------------------------------------------
 # Constants
@@ -172,6 +174,67 @@ ABOUT_URL_TEMPLATE     = "https://www.reddit.com/user/{name}/about/.json"
 # Browser profile directory (relative to script location by default,
 # or override with --profile-dir).
 DEFAULT_PROFILE_DIR = Path.home() / ".reddit_subscriber_profile"
+
+# Pause-flag file — when this file exists, the subscriber pauses processing
+# (used by the auto-update system to safely apply GitHub updates mid-run).
+# The path is passed via the PAUSE_FLAG_FILE environment variable.
+PAUSE_FLAG_FILE = os.environ.get("PAUSE_FLAG_FILE", "")
+
+
+# -------------------------------------------------------------------
+# Internet connectivity check
+# -------------------------------------------------------------------
+
+def check_internet_connection(timeout: float = 5.0) -> bool:
+    """
+    Check if we have a working internet connection by trying to reach
+    Reddit's servers. Returns True if reachable, False otherwise.
+    """
+    try:
+        # Try to connect to Reddit's servers with a short timeout.
+        # We use a raw socket connection to avoid HTTPS overhead.
+        sock = socket.create_connection(("www.reddit.com", 443), timeout=timeout)
+        sock.close()
+        return True
+    except (socket.timeout, OSError, ConnectionError):
+        pass
+    # Fallback: try Google's DNS (very reliable)
+    try:
+        sock = socket.create_connection(("8.8.8.8", 53), timeout=timeout)
+        sock.close()
+        return True
+    except (socket.timeout, OSError, ConnectionError):
+        return False
+
+
+def wait_for_internet(check_interval: float = 30.0) -> None:
+    """
+    Block until an internet connection is available. Logs a message every
+    check_interval seconds. Used at startup and mid-run if the connection drops.
+    """
+    if check_internet_connection():
+        return
+    log.warning("No internet connection detected. Waiting for connectivity...")
+    while not check_internet_connection():
+        log.info("  still offline — retrying in %.0fs...", check_interval)
+        time.sleep(check_interval)
+    log.info("Internet connection restored. Continuing.")
+
+
+def wait_if_paused() -> None:
+    """
+    Check if the pause flag file exists. If so, sleep until it's removed.
+    Called before processing each row so the auto-update system can safely
+    apply updates without interrupting a subscription mid-click.
+    """
+    if not PAUSE_FLAG_FILE:
+        return
+    if not os.path.exists(PAUSE_FLAG_FILE):
+        return
+    log.info("Pause flag detected — waiting for update to complete...")
+    while os.path.exists(PAUSE_FLAG_FILE):
+        time.sleep(2.0)
+    log.info("Pause flag removed — resuming.")
 
 
 # -------------------------------------------------------------------
@@ -1705,6 +1768,10 @@ def run_subscribe_pass(
     total = len(rows)
     log.info("=== SUBSCRIBE PASS === %d total rows", total)
 
+    # Check internet connectivity before starting. If the connection is down
+    # (e.g. Pi lost Wi-Fi), wait until it's back before proceeding.
+    wait_for_internet()
+
     # Pre-flight shadowban check.
     try:
         is_banned, reason = check_shadowban(session, username)
@@ -1755,9 +1822,11 @@ def run_subscribe_pass(
     # CSV file). Instead we build a list of indices in priority order and
     # iterate that.
     def _priority(status: str) -> int:
-        if status == "pending":
-            return 0
+        # Failed rows are processed FIRST so they get retried immediately
+        # at the start of each run, before any new pending rows.
         if status == "failed":
+            return 0
+        if status == "pending":
             return 1
         if status == "shadowbanned":
             return 2
@@ -1767,7 +1836,7 @@ def run_subscribe_pass(
             return 4
         if status in TERMINAL_STATUSES:
             return 5
-        return 0  # unknown statuses treated as pending
+        return 1  # unknown statuses treated as pending
 
     # Build (priority, original_index, row) tuples, then sort.
     # Using original_index as tiebreaker keeps CSV order stable within each
@@ -1790,6 +1859,15 @@ def run_subscribe_pass(
         raw_name = row.get(sub_col, "")
         name = _normalize_sub_name(raw_name)
         current_status = (row.get(STATUS_COL) or "pending").strip()
+
+        # Check if the auto-update system has set the pause flag.
+        # If so, block here until the update is done, then continue.
+        wait_if_paused()
+
+        # Check internet connectivity. If we've lost connection mid-run
+        # (e.g. Wi-Fi dropped), wait for it to come back before continuing.
+        if not check_internet_connection(timeout=5.0):
+            wait_for_internet()
 
         if not name:
             row[STATUS_COL]        = SubscribeResult.NOT_FOUND
