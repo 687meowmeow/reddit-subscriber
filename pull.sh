@@ -80,8 +80,12 @@ if [ "$CHECK_ONLY" = "true" ]; then
 fi
 
 # --- Apply the update ------------------------------------------------------
-echo "[info] Pulling changes..."
-git pull origin "$BRANCH" 2>&1 | sed 's/^/  /'
+# Use `git reset --hard origin/<branch>` instead of `git pull`.
+# This discards local changes to TRACKED files (like start.sh) but
+# PRESERVES all UNTRACKED files (*.status.csv, .config.json, browser
+# profile) since they're in .gitignore and git doesn't touch them.
+echo "[info] Resetting to origin/$BRANCH (local changes to tracked files discarded, CSVs preserved)..."
+git reset --hard "origin/$BRANCH" 2>&1 | sed 's/^/  /'
 
 # --- Install any new dependencies -----------------------------------------
 echo ""

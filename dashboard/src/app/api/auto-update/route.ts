@@ -14,7 +14,7 @@ const execAsync = promisify(exec);
 // 2. If autoUpdate is disabled, just returns current commit info
 // 3. Runs `git fetch origin` (using PAT for auth if needed)
 // 4. Compares local HEAD with remote HEAD
-// 5. If different, runs `git pull` and returns what changed
+// 5. If different, runs `git reset --hard origin/<branch>` and returns what changed
 // 6. If package.json or requirements.txt changed, runs install
 // 7. Returns: { hasUpdates, oldCommit, newCommit, changedFiles }
 //
@@ -183,11 +183,12 @@ export async function GET() {
   }
 
   try {
-    const remoteUrl = authedRemoteUrl(config.githubRepo!, config.githubPat);
+    // The repo is public, so we don't need PAT for fetch/pull.
+    // Set the remote to the plain URL (without PAT) to avoid auth issues.
+    const plainUrl = config.githubRepo!;
 
-    // Configure the remote with the authed URL so git fetch/pull work without prompts
     try {
-      await git(["remote", "set-url", "origin", remoteUrl], cwd);
+      await git(["remote", "set-url", "origin", plainUrl], cwd);
     } catch {}
 
     const remoteHead = await getRemoteHead(cwd, branch);
@@ -198,7 +199,7 @@ export async function GET() {
         isGitRepo: true,
         currentCommit,
         branch,
-        error: "Could not fetch from remote. Check your GitHub repo URL and PAT.",
+        error: "Could not fetch from remote. Check your GitHub repo URL.",
         lastChecked: new Date().toISOString(),
       });
     }
@@ -220,27 +221,27 @@ export async function GET() {
     const changedFiles = await getChangedFiles(cwd, oldCommit || "HEAD", newCommit);
     const commitLog = await getCommitLog(cwd, oldCommit || "HEAD", newCommit);
 
-    // Pull
+    // Use `git reset --hard origin/<branch>` instead of `git pull`.
+    // This discards any local changes to TRACKED files (like start.sh)
+    // that the user may have edited, but PRESERVES all UNTRACKED files
+    // (like *.status.csv, .config.json, browser profile) because they're
+    // in .gitignore and git doesn't touch them.
+    //
+    // We already fetched above (in getRemoteHead), so origin/<branch>
+    // is up to date. Just reset to it.
     try {
-      await git(["pull", "origin", branch], cwd, {
+      await git(["reset", "--hard", `origin/${branch}`], cwd, {
         GIT_TERMINAL_PROMPT: "0",
       });
-    } catch (err) {
-      // Try with the authed URL directly
-      try {
-        await git(["pull", remoteUrl, branch], cwd, {
-          GIT_TERMINAL_PROMPT: "0",
-        });
-      } catch (err2: any) {
-        return NextResponse.json({
-          enabled: true,
-          isGitRepo: true,
-          currentCommit,
-          branch,
-          error: `git pull failed: ${err2.message}`,
-          lastChecked: new Date().toISOString(),
-        });
-      }
+    } catch (err: any) {
+      return NextResponse.json({
+        enabled: true,
+        isGitRepo: true,
+        currentCommit,
+        branch,
+        error: `git reset --hard failed: ${err.message}`,
+        lastChecked: new Date().toISOString(),
+      });
     }
 
     let nodeDepsInstalled = false;
