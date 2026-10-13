@@ -1738,7 +1738,55 @@ def run_subscribe_pass(
     consecutive_failures = 0
     aborted_reason: Optional[str] = None
 
-    for i, row in enumerate(rows, 1):
+    # --- PRIORITY SORTING -------------------------------------------------
+    # Process rows in this order:
+    #   1. pending         (highest — never been touched)
+    #   2. failed          (retryable — last run errored)
+    #   3. shadowbanned    (retryable — last run was shadowbanned)
+    #   4. aborted         (retryable — last run hit session cap)
+    #   SKIP:
+    #   5. subscribed / already_subscribed  (DONE — unless --verify-only)
+    #   6. not_found / banned / private / quarantined  (TERMINAL — skip)
+    #
+    # This gets the actual work done first instead of iterating through
+    # 4000 already-subscribed rows to find the 5 pending ones.
+    #
+    # We DON'T reorder the underlying `rows` list (which would mess up the
+    # CSV file). Instead we build a list of indices in priority order and
+    # iterate that.
+    def _priority(status: str) -> int:
+        if status == "pending":
+            return 0
+        if status == "failed":
+            return 1
+        if status == "shadowbanned":
+            return 2
+        if status == "aborted":
+            return 3
+        if status in DONE_STATUSES:
+            return 4
+        if status in TERMINAL_STATUSES:
+            return 5
+        return 0  # unknown statuses treated as pending
+
+    # Build (priority, original_index, row) tuples, then sort.
+    # Using original_index as tiebreaker keeps CSV order stable within each
+    # priority bucket.
+    indexed_rows = sorted(
+        enumerate(rows),
+        key=lambda pair: (_priority((pair[1].get(STATUS_COL) or "pending").strip()), pair[0])
+    )
+
+    # Count what's in each bucket (for logging)
+    bucket_counts: Dict[str, int] = {}
+    for _, r in indexed_rows:
+        s = (r.get(STATUS_COL) or "pending").strip()
+        bucket_counts[s] = bucket_counts.get(s, 0) + 1
+    log.info("Row priority breakdown:")
+    for status, count in sorted(bucket_counts.items(), key=lambda x: -x[1]):
+        log.info("  %-20s %5d", status, count)
+
+    for i, (original_idx, row) in enumerate(indexed_rows, 1):
         raw_name = row.get(sub_col, "")
         name = _normalize_sub_name(raw_name)
         current_status = (row.get(STATUS_COL) or "pending").strip()
@@ -1752,7 +1800,7 @@ def run_subscribe_pass(
 
         # Skip rows we've already successfully handled (resume support).
         if current_status in DONE_STATUSES:
-            log.info("[%d/%d] r/%s — skip (already %s)", i, total, name, current_status)
+            log.debug("[%d/%d] r/%s — skip (already %s)", i, total, name, current_status)
             continue
 
         # Skip terminal-status rows too (banned / not_found / etc.).
