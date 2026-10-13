@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+
+# Browser profile
+.reddit_subscriber_profile/
+
+# Run logs
+*.csv.log
+
+# OS
+.DS_Store
+.vscode/
+.idea/
+
+# Dashboard runtime config (paths differ per machine)
+dashboard/.config.json
+
+# Status files (per-machine, regenerated)
+*.status.csv
