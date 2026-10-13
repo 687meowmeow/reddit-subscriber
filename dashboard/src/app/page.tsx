@@ -6,7 +6,7 @@ import {
   CheckCircle2, XCircle, AlertCircle, Clock, Users, RefreshCw, Search,
   Loader2, FileText, Activity, Ban, Lock, ShieldAlert, Eye, EyeOff,
   ChevronDown, Filter, ExternalLink, Bug, Play, Square, Terminal, Settings,
-  Github,
+  Github, Upload,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -240,6 +240,11 @@ export default function Home() {
   const [lastUpdateCheck, setLastUpdateCheck] = useState<Date | null>(null);
   const [updateNotification, setUpdateNotification] = useState<string | null>(null);
 
+  // CSV upload state
+  const [uploading, setUploading] = useState(false);
+  const [uploadResult, setUploadResult] = useState<any>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
   // Debug panel state
   const [showDebug, setShowDebug] = useState<boolean>(false);
   const [debugInfo, setDebugInfo] = useState<any>(null);
@@ -402,6 +407,36 @@ export default function Home() {
       setTimeout(() => setUpdateNotification(null), 30000);
     }
   }, []);
+
+  // Handle CSV file upload (import from another device)
+  const handleFileUpload = useCallback(async (file: File) => {
+    setUploading(true);
+    setUploadResult(null);
+    try {
+      const formData = new FormData();
+      formData.append("file", file);
+      const res = await fetch("/api/csv-upload", {
+        method: "POST",
+        body: formData,
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setUploadResult({ error: data.error || `HTTP ${res.status}` });
+      } else {
+        setUploadResult(data);
+        // Refresh the CSV list so the new file appears in the dropdown
+        await fetchCsvList();
+        // Auto-select the newly uploaded file
+        if (data.filename) {
+          setSelectedCsv(data.filename);
+        }
+      }
+    } catch (err) {
+      setUploadResult({ error: err instanceof Error ? err.message : String(err) });
+    } finally {
+      setUploading(false);
+    }
+  }, [fetchCsvList]);
 
   // Initial load — fetch settings first, then CSV list
   useEffect(() => {
@@ -586,6 +621,37 @@ export default function Home() {
               title="Refresh now"
             >
               <RefreshCw className={cn("w-4 h-4", refreshing && "animate-spin")} />
+            </Button>
+
+            {/* Import CSV — upload from another device */}
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept=".csv,.status.csv"
+              className="hidden"
+              onChange={(e) => {
+                const file = e.target.files?.[0];
+                if (file) {
+                  handleFileUpload(file);
+                }
+                // Reset the input so the same file can be selected again
+                e.target.value = "";
+              }}
+            />
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => fileInputRef.current?.click()}
+              disabled={uploading}
+              title="Upload a CSV file from this device to the Pi"
+              className="gap-1.5"
+            >
+              {uploading ? (
+                <Loader2 className="w-4 h-4 animate-spin" />
+              ) : (
+                <Upload className="w-4 h-4" />
+              )}
+              Import CSV
             </Button>
 
             {/* Settings button */}
@@ -1010,6 +1076,68 @@ export default function Home() {
                   )}
                 </div>
               )}
+            </CardContent>
+          </Card>
+        )}
+
+        {/* Upload result display */}
+        {uploadResult && (
+          <Card className={
+            uploadResult.error
+              ? "border-red-200 dark:border-red-800 bg-red-50 dark:bg-red-950/30"
+              : "border-emerald-200 dark:border-emerald-800 bg-emerald-50 dark:bg-emerald-950/30"
+          }>
+            <CardContent className="pt-6">
+              <div className="flex items-start gap-3">
+                {uploadResult.error ? (
+                  <XCircle className="w-5 h-5 flex-shrink-0 text-red-600 dark:text-red-400" />
+                ) : (
+                  <CheckCircle2 className="w-5 h-5 flex-shrink-0 text-emerald-600 dark:text-emerald-400" />
+                )}
+                <div className="flex-1">
+                  <p className="font-semibold">
+                    {uploadResult.error ? "Upload Failed" : "CSV Imported"}
+                  </p>
+                  {uploadResult.error ? (
+                    <p className="text-sm text-red-600 dark:text-red-400">{uploadResult.error}</p>
+                  ) : (
+                    <div className="text-sm text-emerald-700 dark:text-emerald-300 space-y-1">
+                      <p>{uploadResult.message}</p>
+                      <p className="text-xs">
+                        <strong>{uploadResult.filename}</strong> · {uploadResult.rows} rows · {(uploadResult.size / 1024).toFixed(1)} KB
+                      </p>
+                      {uploadResult.isStatusFile && (
+                        <p className="text-xs text-emerald-600 dark:text-emerald-400">
+                          Status file detected — existing subscription progress will be preserved.
+                        </p>
+                      )}
+                      {uploadResult.hasStatusColumn && uploadResult.statusCounts && Object.keys(uploadResult.statusCounts).length > 0 && (
+                        <div className="text-xs mt-1">
+                          <span className="text-slate-600 dark:text-slate-400">Status counts:</span>{" "}
+                          {Object.entries(uploadResult.statusCounts).map(([status, count]) => (
+                            <Badge key={status} variant="outline" className="ml-1 py-0 px-1.5 text-[10px]">
+                              {status}: {count as number}
+                            </Badge>
+                          ))}
+                        </div>
+                      )}
+                      {uploadResult.overwritten && (
+                        <p className="text-xs text-amber-600 dark:text-amber-400 mt-1">
+                          Note: a file with this name already existed and was overwritten.
+                        </p>
+                      )}
+                    </div>
+                  )}
+                </div>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => setUploadResult(null)}
+                  className="text-slate-500"
+                >
+                  Dismiss
+                </Button>
+              </div>
             </CardContent>
           </Card>
         )}

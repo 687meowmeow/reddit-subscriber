@@ -2,20 +2,25 @@ import { NextResponse } from "next/server";
 import type { NextRequest } from "next/server";
 
 // ============================================================
-// Middleware — runs on every request.
+// Proxy (formerly "middleware" in Next.js < 16.4)
+// ------------------------------------------------------------
+// Runs on every request. Does two things:
 //
-// 1. Adds permissive CORS headers so the dashboard can be
-//    accessed from ANY device on the network (phone, laptop,
-//    tablet, TV, whatever) regardless of IP or hostname.
+// 1. Adds permissive CORS headers (`Access-Control-Allow-Origin: *`)
+//    so the dashboard can be accessed from ANY device on the
+//    network — phone, laptop, tablet, another Pi — regardless of
+//    IP or hostname.
 //
-// 2. Handles CORS preflight (OPTIONS) requests.
+// 2. Handles CORS preflight (OPTIONS) requests so browser fetch()
+//    calls from any origin succeed.
 //
-// 3. Sets X-Forwarded-Host to the incoming Host header so
-//    Next.js's dev server doesn't reject requests from
-//    non-localhost origins.
+// Note: this is the new Next.js 16.4 convention. The old
+// `middleware.ts` filename is deprecated — use `proxy.ts` instead.
+// The export is still named `middleware` for backwards compat,
+// but Next.js 16.4 also accepts `proxy` as the export name.
 // ============================================================
 
-export function middleware(request: NextRequest) {
+export function proxy(request: NextRequest) {
   // Handle CORS preflight
   if (request.method === "OPTIONS") {
     const response = new NextResponse(null, { status: 204 });
@@ -42,6 +47,9 @@ export function middleware(request: NextRequest) {
 
   return response;
 }
+
+// Backwards-compatible alias (some Next.js versions look for `middleware`)
+export { proxy as middleware };
 
 // Run on all routes (including API and static assets)
 export const config = {
