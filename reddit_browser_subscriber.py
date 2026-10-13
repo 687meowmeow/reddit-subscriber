@@ -1001,23 +1001,153 @@ def _find_join_button(page) -> Optional[object]:
 def _find_already_joined_indicator(page) -> bool:
     """
     Detect if the user is already subscribed to this subreddit.
-    Looks for a "Joined" button (vs "Join").
+
+    This is called BEFORE we attempt to click Join, so we can short-circuit
+    and mark the row as already_subscribed instead of clicking.
+
+    Detection methods (in priority order):
+      1. A visible "Joined" button (aria-label or text content)
+      2. A visible "Leave" / "Unsubscribe" button (only shown when joined)
+      3. The Web Component's `subscribed` attribute on shreddit-subreddit-header-buttons
+      4. JavaScript check via page.evaluate — reads the Web Component's state
+      5. The user's subreddit list from the inline JSON (window.__r)
+
+    Returns True if ANY of these signals indicate the user is subscribed.
     """
+    # --- Method 1: CSS selectors for "Joined" button states ---
     already_indicators = [
+        # sh.reddit.com — the Joined button (after subscription)
         'shreddit-subreddit-header-buttons button[aria-label*="Joined" i]',
         'shreddit-subreddit-header-buttons button:has-text("Joined")',
+        # New reddit (www.reddit.com) — the Joined button
         'button[data-testid="unsubscribe-button"]',
         'button[aria-label*="joined" i]',
+        # The "Leave" button is shown in a dropdown after Joined, but some
+        # UI variants show it directly
+        'button[aria-label*="Leave" i]',
+        'button[aria-label*="leave" i]',
+        'button[data-testid="leave-button"]',
+        # Old reddit — the "leave" toggle
         'a.fancy-toggle-button.remove',
+        'a.fancy-toggle-button:has-text("leave")',
+        # Generic fallback — any button whose text is "Joined"
         'button:has-text("Joined")',
     ]
     for sel in already_indicators:
         try:
             loc = page.locator(sel).first
-            if loc.count() > 0 and loc.is_visible(timeout=1000):
-                return True
+            if loc.count() > 0:
+                try:
+                    if loc.is_visible(timeout=1000):
+                        return True
+                except Exception:
+                    # If is_visible times out, the element may still exist
+                    # in the DOM — count it as subscribed
+                    return True
         except Exception:
             continue
+
+    # --- Method 2: Check the shreddit-subreddit-header-buttons component's state ---
+    # The Web Component exposes its subscription state via attributes and
+    # properties. Check several of them.
+    try:
+        # Check the `subscribed` attribute / property on the Web Component
+        is_subscribed = page.evaluate(
+            """
+            () => {
+                // Method A: Check the shreddit-subreddit-header-buttons element
+                const header = document.querySelector('shreddit-subreddit-header-buttons');
+                if (header) {
+                    // The component exposes `subscribed` as a property
+                    if (header.getAttribute('subscribed') === 'true') return true;
+                    if (header.shadowRoot) {
+                        // Look inside the shadow root for a Joined button
+                        const joinedBtn = header.shadowRoot.querySelector(
+                            'button[aria-label*="Joined" i], button:has-text("Joined")'
+                        );
+                        if (joinedBtn) return true;
+                    }
+                }
+
+                // Method B: Check the inline JSON for the user's subscription state
+                // Reddit embeds subreddit data in window.__r or a <script> tag
+                const scripts = document.querySelectorAll('script[type="application/json"]');
+                for (const s of scripts) {
+                    try {
+                        const text = s.textContent || '';
+                        if (text.includes('"isSubscribed":true') ||
+                            text.includes('"is_subscribed":true') ||
+                            text.includes('"userIsSubscriber":true') ||
+                            text.includes('"user_is_subscriber":true')) {
+                            return true;
+                        }
+                    } catch (e) {}
+                }
+
+                // Method C: Check window.___r (Reddit's internal state)
+                try {
+                    const r = window.___r || window.__r;
+                    if (r && r.traits && r.traits.subreddit) {
+                        if (r.traits.subreddit.user_is_subscriber === true) return true;
+                    }
+                } catch (e) {}
+
+                // Method D: Check for "Joined" text anywhere in the header area
+                const headerArea = document.querySelector(
+                    'shreddit-subreddit-header, .subreddit-header, [data-testid="subreddit-header"]'
+                );
+                if (headerArea && headerArea.textContent &&
+                    headerArea.textContent.toLowerCase().includes('joined') &&
+                    !headerArea.textContent.toLowerCase().includes('join')) {
+                    return true;
+                }
+
+                return false;
+            }
+            """
+        )
+        if is_subscribed:
+            return True
+    except Exception as exc:
+        log.debug("evaluate-based already-subscribed check failed: %s", exc)
+
+    # --- Method 3: Check the subreddit's about.json via the logged-in cookie ---
+    # This is a fallback — only use if the above methods didn't find anything,
+    # because it makes an extra HTTP request.
+    try:
+        current_url = page.url
+        # Extract subreddit name from URL (e.g. https://www.reddit.com/r/AskReddit/)
+        import re
+        match = re.search(r'/r/([A-Za-z0-9_]+)/?', current_url)
+        if match:
+            sub_name = match.group(1)
+            # Use the page's existing session (cookies) to fetch the about.json
+            result = page.evaluate(
+                """
+                async (subName) => {
+                    try {
+                        const res = await fetch(`https://www.reddit.com/r/${subName}/about.json`, {
+                            credentials: 'include'
+                        });
+                        if (!res.ok) return false;
+                        const data = await res.json();
+                        // Check the user_is_subscriber field
+                        if (data && data.data && data.data.user_is_subscriber === true) {
+                            return true;
+                        }
+                        return false;
+                    } catch (e) {
+                        return false;
+                    }
+                }
+                """,
+                sub_name
+            )
+            if result:
+                return True
+    except Exception as exc:
+        log.debug("about.json-based already-subscribed check failed: %s", exc)
+
     return False
 
 

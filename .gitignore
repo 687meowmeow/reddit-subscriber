@@ -23,5 +23,8 @@ venv/
 # Dashboard runtime config (paths differ per machine)
 dashboard/.config.json
 
-# Status files (per-machine, regenerated)
-*.status.csv
+# ALL CSV files — these are user data, not source code.
+# Includes both input CSVs (subreddits.csv) and status CSVs
+# (subreddits.status.csv with subscription progress).
+# Users import their own CSVs via the dashboard UI.
+*.csv
