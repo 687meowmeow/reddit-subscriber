@@ -114,6 +114,14 @@ if [ -n "$PYTHON_BIN" ] && [ -f "$SCRIPT_DIR/requirements.txt" ]; then
             fi
         fi
     fi
+
+    # Make sure Xvfb is installed (for virtual display when no monitor)
+    if [[ "$IS_PI" == "true" ]]; then
+        if ! command -v Xvfb >/dev/null 2>&1; then
+            echo "  [setup] Installing Xvfb (virtual display)..."
+            sudo apt install -y xvfb 2>&1 | tail -2 || true
+        fi
+    fi
 fi
 
 # --- Step 2: Install Node deps (only if node_modules missing) --------------

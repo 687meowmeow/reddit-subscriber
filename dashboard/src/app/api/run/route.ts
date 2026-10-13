@@ -1,8 +1,96 @@
 import { NextRequest, NextResponse } from "next/server";
-import { spawn, ChildProcess } from "child_process";
+import { spawn, execSync, ChildProcess } from "child_process";
 import path from "path";
 import { promises as fs } from "fs";
 import fsSync from "fs";
+
+// ============================================================
+// Display detection — ensures Chromium can open a window even
+// when the Pi boots without a desktop session running.
+//
+// Priority:
+//   1. Use existing DISPLAY env var if the X server is reachable
+//   2. Detect a running VNC server (:1, :2, ...) and use that
+//   3. Start Xvfb on :99 as a virtual display fallback
+//
+// We do NOT auto-start TigerVNC because it requires a password
+// to be configured and may prompt interactively. Xvfb is safe to
+// start non-interactively.
+// ============================================================
+
+function xServerReachable(display: string): boolean {
+  try {
+    // Check if we can list windows on this display via xset
+    execSync(`DISPLAY=${display} xset q`, {
+      timeout: 3000,
+      stdio: "ignore",
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function findVncDisplay(): string | null {
+  // TigerVNC and RealVNC create displays :1, :2, etc.
+  // Check if any of these are running and reachable.
+  for (let d = 1; d <= 5; d++) {
+    const display = `:${d}`;
+    if (xServerReachable(display)) {
+      return display;
+    }
+  }
+  return null;
+}
+
+function startXvfb(): string | null {
+  // Start a virtual framebuffer on display :99.
+  // This lets Chromium run in headed mode without a physical monitor
+  // or VNC server. The user won't see the browser window, but it won't
+  // be headless (which would increase shadowban risk).
+  try {
+    // Kill any existing Xvfb on :99
+    try {
+      execSync("pkill -f 'Xvfb :99'", { stdio: "ignore", timeout: 2000 });
+    } catch {}
+    // Start Xvfb with a reasonable resolution
+    execSync(
+      "Xvfb :99 -screen 0 1920x1080x24 -ac &",
+      { stdio: "ignore", timeout: 5000, detached: true }
+    );
+    // Wait a moment for it to start
+    setTimeout(() => {}, 1000);
+    // Verify it's running
+    if (xServerReachable(":99")) {
+      return ":99";
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function ensureDisplay(): { display: string; method: string } | null {
+  // 1. Check if DISPLAY is already set and reachable
+  const currentDisplay = process.env.DISPLAY;
+  if (currentDisplay && xServerReachable(currentDisplay)) {
+    return { display: currentDisplay, method: "existing DISPLAY" };
+  }
+
+  // 2. Check for a running VNC server
+  const vncDisplay = findVncDisplay();
+  if (vncDisplay) {
+    return { display: vncDisplay, method: "VNC server detected" };
+  }
+
+  // 3. Start Xvfb as a fallback
+  const xvfbDisplay = startXvfb();
+  if (xvfbDisplay) {
+    return { display: xvfbDisplay, method: "Xvfb virtual display started" };
+  }
+
+  return null;
+}
 
 // ============================================================
 // Read config from .config.json
@@ -143,6 +231,27 @@ export async function POST(request: NextRequest) {
       args.push("--max-subscribes", String(body.maxSubscribes));
     }
 
+    // --- Display detection ---
+    // On the Pi, Chromium needs a display to run in headed mode. If the
+    // Pi booted without a desktop session (no VNC running), we need to
+    // provide a virtual display. This only runs on Linux and only when
+    // --headless is NOT requested.
+    let displayInfo: { display: string; method: string } | null = null;
+    if (process.platform !== "win32" && body.headless !== true) {
+      displayInfo = ensureDisplay();
+      if (displayInfo) {
+        addLog("stderr", `[dashboard] Display: ${displayInfo.display} (${displayInfo.method})`);
+      } else {
+        // No display available — fall back to headless mode automatically
+        addLog("stderr", "[dashboard] No display available — falling back to headless mode");
+        addLog("stderr", "[dashboard] To see the browser, start your VNC server:");
+        addLog("stderr", "[dashboard]   vncserver :1 -geometry 1920x1080");
+        if (!args.includes("--headless")) {
+          args.push("--headless");
+        }
+      }
+    }
+
     // Build environment
     const childEnv: Record<string, string> = {
       ...process.env,
@@ -152,6 +261,10 @@ export async function POST(request: NextRequest) {
       // check for it between rows and pause when a GitHub update is applying.
       PAUSE_FLAG_FILE: path.join(csvRoot, ".update-pause-flag"),
     };
+    // If we detected/started a display, pass it to the child process
+    if (displayInfo) {
+      childEnv.DISPLAY = displayInfo.display;
+    }
     // Use credentials from the request body if provided, otherwise fall back
     // to stored credentials from .config.json (so the user doesn't have to
     // re-enter them every time).

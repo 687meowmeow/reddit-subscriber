@@ -118,5 +118,33 @@
   }
   body {
     @apply bg-background text-foreground;
+    /* Prevent the browser from showing a horizontal scrollbar when
+       elements are slightly wider than the viewport on mobile.
+       The table container has its own overflow-auto. */
+    overflow-x: hidden;
+    /* Improve touch scrolling on iOS — makes the site feel more
+       "native" and responsive on phones. */
+    -webkit-overflow-scrolling: touch;
+    /* Prevent text selection on button taps (feels more app-like) */
+    -webkit-tap-highlight-color: transparent;
+    /* Disable the 300ms tap delay on mobile (modern browsers do this
+       automatically when viewport is set, but this ensures it) */
+    touch-action: manipulation;
+  }
+  /* Ensure touch targets are at least 44x44px (Apple's minimum
+     recommendation for touch targets) */
+  button, [role="button"], a {
+    min-height: 36px;
+  }
+  /* Make the sticky header not jitter on iOS Safari — use position
+     sticky with -webkit-sticky for backwards compat */
+  header {
+    position: -webkit-sticky;
+    position: sticky;
+    top: 0;
+  }
+  /* Improve table scrolling on touch devices */
+  table {
+    -webkit-overflow-scrolling: touch;
   }
 }

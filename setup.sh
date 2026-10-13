@@ -85,6 +85,23 @@ echo ""
 "$PY_CMD" -m pip install -r requirements.txt
 echo ""
 
+# --- 2b. Virtual display tools (Linux only) ---
+# Xvfb lets Chromium run in headed mode without a physical monitor.
+# This is needed when the Pi boots without a desktop session.
+if [[ "$IS_PI" == "true" || "$OSTYPE" == "linux-gnu"* ]]; then
+    echo "[2b/5] Installing Xvfb (virtual display for headless Pi)..."
+    if command -v apt >/dev/null 2>&1; then
+        sudo apt install -y xvfb xset 2>&1 | tail -3
+    elif command -v dnf >/dev/null 2>&1; then
+        sudo dnf install -y xorg-x11-server-Xvfb xset 2>&1 | tail -3
+    elif command -v yum >/dev/null 2>&1; then
+        sudo yum install -y xorg-x11-server-Xvfb xset 2>&1 | tail -3
+    else
+        echo "      [WARN] Could not detect package manager. Install xvfb manually."
+    fi
+    echo ""
+fi
+
 # --- 3. Chromium binary ---
 echo "[3/5] Downloading Chromium browser binary for Playwright (~150MB)..."
 if [[ "$IS_PI" == "true" ]]; then
