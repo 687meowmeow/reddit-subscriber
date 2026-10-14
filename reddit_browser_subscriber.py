@@ -774,10 +774,91 @@ class BrowserSession:
             except Exception as exc:
                 log.warning("stealth apply failed: %s", exc)
 
-        # Block unnecessary resources to reduce bandwidth + look more human
-        # (real users have ads blocked or unblocked — we'll leave ads enabled
-        # to be safe; blocking them can be a fingerprint).
-        # We DO block autoplay video to keep things quiet.
+        # ----------------------------------------------------------------
+        # BLOCK UNNECESSARY RESOURCES — critical for Pi stability
+        # ----------------------------------------------------------------
+        # Each Reddit page load normally opens 50-100 TCP connections
+        # (images, CSS, fonts, ads, tracking). These linger in TIME_WAIT
+        # for 60-120s after closing. After ~23 rows × 100 connections,
+        # the Pi's connection table overflows and the NETWORK INTERFACE
+        # CRASHES — taking down SSH, VNC, and pi-hole.
+        #
+        # Fix: intercept and abort all non-essential resource requests.
+        # We only need HTML + JS to find and click the Join button.
+        # This cuts connections per page from ~100 to ~5.
+        # ----------------------------------------------------------------
+        BLOCKED_RESOURCE_TYPES = {
+            "image",        # all images (icons, thumbnails, banners)
+            "media",        # video, audio
+            "font",         # web fonts (woff, woff2, ttf)
+            "stylesheet",   # CSS files (we don't need styles to find a button)
+        }
+
+        # Domains to block entirely (ads, analytics, tracking)
+        BLOCKED_DOMAINS = {
+            "doubleclick.net",
+            "googlesyndication.com",
+            "google-analytics.com",
+            "googletagmanager.com",
+            "amazon-adsystem.com",
+            "adsystem.com",
+            "scorecardresearch.com",
+            "quantserve.com",
+            "adnxs.com",
+            "criteo.com",
+            "taboola.com",
+            "outbrain.com",
+            "adsrvr.org",
+            "pubmatic.com",
+            "rubiconproject.com",
+            "openx.net",
+            "casalemedia.com",
+            "moatads.com",
+            "adservice.google.com",
+            "cdn.branch.io",
+            "analytics.reddit.com",
+            "events.reddit.com",
+            "stats.g.doubleclick.net",
+        }
+
+        def _should_block(route):
+            """Return True if this request should be blocked."""
+            try:
+                url = route.request.url
+                resource_type = route.request.resource_type
+
+                # Block by resource type
+                if resource_type in BLOCKED_RESOURCE_TYPES:
+                    return True
+
+                # Block by domain
+                url_lower = url.lower()
+                for domain in BLOCKED_DOMAINS:
+                    if domain in url_lower:
+                        return True
+
+                return False
+            except Exception:
+                return False
+
+        def _handle_route(route):
+            """Playwright route handler — aborts non-essential requests."""
+            if _should_block(route):
+                try:
+                    route.abort()
+                except Exception:
+                    pass
+            else:
+                try:
+                    route.continue_()
+                except Exception:
+                    pass
+
+        try:
+            self._browser.route("**/*", _handle_route)
+            log.info("Resource blocking enabled (images, CSS, fonts, ads blocked)")
+        except Exception as exc:
+            log.warning("Failed to set up resource blocking: %s", exc)
 
     def ensure_logged_in(self, force_login_prompt: bool = False) -> str:
         """
@@ -2150,6 +2231,15 @@ def run_subscribe_pass(
         # chrome process count.
         if subscribe_count > 0 and subscribe_count % 10 == 0:
             log_system_health(f"every 10 subs (count={subscribe_count})")
+
+            # --- NETWORK COOLDOWN ---
+            # Every 10 subscribes, pause for 2 minutes to let all TCP
+            # connections fully close. Without this, connections accumulate
+            # in TIME_WAIT state and eventually crash the Pi's network
+            # interface (taking down SSH, VNC, and pi-hole).
+            log.info("Network cooldown — pausing 120s to let TCP connections close...")
+            time.sleep(120)
+            log.info("Cooldown complete. Continuing.")
 
         # --- RESOURCE CHECK ---
         # Check available RAM and disk space. If RAM is low, pause and wait
