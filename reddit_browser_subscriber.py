@@ -169,14 +169,14 @@ SHADOWBAN_CHECK_THRESHOLD = 5
 # Chromium is notoriously bad at releasing RAM — over thousands of page loads,
 # it can consume all available memory on a Pi, causing the OOM killer to
 # kill sshd, pi-hole, and other critical services.
-# With 8GB RAM, we can go longer between restarts.
-BROWSER_RESTART_EVERY_N = 30
+# With 8GB RAM, every 15 subscribes is aggressive but safe.
+BROWSER_RESTART_EVERY_N = 15
 
 # Minimum available RAM (in MB) required to continue processing.
 # If the Pi drops below this, we pause and wait for memory to be freed
 # before continuing. This protects pi-hole and sshd from the OOM killer.
-# With 8GB total, 200 MB is a safe floor (leaves room for system services).
-MIN_AVAILABLE_RAM_MB = 200  # 200 MB — if below this, pause
+# With 8GB total, 500 MB is a safe floor — leaves plenty for system services.
+MIN_AVAILABLE_RAM_MB = 500  # 500 MB — if below this, pause and wait
 
 # Maximum log file size (in MB) before rotation kicks in.
 MAX_LOG_FILE_SIZE_MB = 50
@@ -327,32 +327,56 @@ def check_system_resources(csv_path_str: str = ".") -> bool:
 
 def kill_orphaned_chromium() -> int:
     """
-    Kill any orphaned Chromium/chrome processes left over from previous runs.
+    Kill ANY orphaned Chromium/chrome processes left over from previous runs.
     Returns the number of processes killed.
 
-    This is called at startup and on exit to prevent zombie processes from
-    accumulating and consuming RAM.
+    This is called at startup, on exit, and during browser restarts to prevent
+    zombie processes from accumulating and consuming RAM.
+
+    Uses multiple search patterns to catch ALL Chromium variants:
+    - chrome-linux-arm64/chrome (Playwright's Chromium)
+    - chromium-browser (system Chromium)
+    - headless_shell (Playwright headless mode)
     """
     killed = 0
     if not sys.platform.startswith("linux"):
         return killed
     try:
         import subprocess
-        # Find chromium/chrome processes (but not our own subprocess tree)
-        result = subprocess.run(
-            ["pgrep", "-f", "chrome-linux-arm64/chrome"],
-            capture_output=True, text=True, timeout=5
-        )
-        pids = result.stdout.strip().split("\n") if result.stdout.strip() else []
-        for pid_str in pids:
-            pid = pid_str.strip()
-            if not pid:
-                continue
+        # Search patterns for all Chromium process variants
+        patterns = [
+            "chrome-linux-arm64/chrome",
+            "chrome-linux/chrome",
+            "chromium-browser",
+            "chromium",
+            "headless_shell",
+            "chrome --type=",          # Chromium's child processes
+        ]
+        pids_killed = set()
+        for pattern in patterns:
             try:
-                os.kill(int(pid), 9)  # SIGKILL
-                killed += 1
-            except (ProcessLookupError, ValueError, PermissionError):
-                pass
+                result = subprocess.run(
+                    ["pgrep", "-f", pattern],
+                    capture_output=True, text=True, timeout=5
+                )
+                pids = result.stdout.strip().split("\n") if result.stdout.strip() else []
+                for pid_str in pids:
+                    pid_str = pid_str.strip()
+                    if not pid_str:
+                        continue
+                    pid = int(pid_str)
+                    if pid in pids_killed:
+                        continue
+                    if pid == os.getpid():
+                        continue  # don't kill ourselves
+                    try:
+                        os.kill(pid, 9)  # SIGKILL
+                        pids_killed.add(pid)
+                        killed += 1
+                    except (ProcessLookupError, ValueError, PermissionError):
+                        pass
+            except Exception:
+                continue
         if killed > 0:
             log.info("Killed %d orphaned Chromium process(es).", killed)
     except Exception as exc:
@@ -643,10 +667,35 @@ class BrowserSession:
 
         self._playwright = sync_playwright().start()
 
+        # Chromium launch flags — tuned to minimize memory usage on the Pi.
+        # Without these, Chromium spawns multiple processes per page and
+        # leaks RAM until the OOM killer takes down pi-hole and sshd.
         launch_args = [
             "--disable-blink-features=AutomationControlled",
             "--no-first-run",
             "--no-default-browser-check",
+            # --- Memory reduction flags ---
+            "--disable-gpu",                    # no GPU on Pi, saves ~50MB
+            "--disable-software-rasterizer",    # no SW rendering, saves CPU+RAM
+            "--disable-dev-shm-usage",          # use /tmp instead of /dev/shm
+            "--disable-extensions",             # no extension processes
+            "--disable-background-networking",  # no background fetch
+            "--disable-background-timer-throttling",
+            "--disable-backgrounding-occluded-windows",
+            "--disable-renderer-backgrounding",
+            "--disable-features=BackForwardCache,Translate,MediaRouter",
+            "--disable-breakpad",               # no crash reporter
+            "--disable-component-update",       # no updater process
+            "--disable-sync",                   # no sync service
+            "--no-sandbox",                    # skip sandbox (saves RAM)
+            "--disable-session-crashed-bubble",
+            "--disable-infobars",
+            "--disable-notifications",
+            "--disable-popup-blocking",
+            # Limit per-tab memory by forcing a smaller JS heap
+            "--js-flags=--max-old-space-size=128",
+            # Don't let Chromium manage its own memory pressure
+            "--memory-pressure-off",
         ]
 
         self._browser = self._playwright.chromium.launch_persistent_context(
@@ -1042,8 +1091,26 @@ class BrowserSession:
         return self._browser.new_page()
 
     def close(self) -> None:
-        """Close browser, persist cookies to profile dir."""
+        """Close browser, persist cookies to profile dir.
+
+        CRITICAL: Playwright's browser.close() does NOT kill all of
+        Chromium's child processes (renderer, GPU, zygote). They become
+        orphans and keep consuming RAM. On the Pi, this eventually triggers
+        the OOM killer which takes down pi-hole and sshd.
+
+        We forcefully kill ALL chrome processes after closing the browser
+        to ensure no memory is leaked between runs.
+        """
         if self._browser is not None:
+            try:
+                # Close all pages first
+                for page in self._browser.pages:
+                    try:
+                        page.close()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
             try:
                 self._browser.close()
             except Exception:
@@ -1055,6 +1122,13 @@ class BrowserSession:
                 pass
         self._browser = None
         self._playwright = None
+
+        # NUCLEAR OPTION: kill ALL chrome/chromium processes.
+        # Playwright's close() leaves orphaned renderer/GPU processes
+        # that continue consuming RAM. We must kill them all.
+        kill_orphaned_chromium()
+        # Small delay to let the OS reclaim the memory
+        time.sleep(2)
 
 
 # -------------------------------------------------------------------
@@ -2024,22 +2098,49 @@ def run_subscribe_pass(
         # accumulates RAM over thousands of page loads and eventually
         # triggers the OOM killer, which takes down pi-hole and sshd.
         if subscribe_count > 0 and subscribe_count % BROWSER_RESTART_EVERY_N == 0:
+            ram_before = get_available_ram_mb()
             log.info("Restarting browser to release memory (every %d subscribes)...",
                      BROWSER_RESTART_EVERY_N)
+            log.info("  RAM before restart: %.0f MB", ram_before)
             try:
+                # close() now kills ALL orphaned Chromium processes
                 session.close()
-                time.sleep(3)
-                kill_orphaned_chromium()
-                time.sleep(2)
+                # Extra safety: kill any that survived
+                killed = kill_orphaned_chromium()
+                if killed > 0:
+                    log.info("  Killed %d additional orphaned process(es).", killed)
+                # Wait for OS to reclaim the memory
+                time.sleep(5)
+                ram_after_kill = get_available_ram_mb()
+                log.info("  RAM after kill: %.0f MB (freed %.0f MB)",
+                         ram_after_kill, ram_after_kill - ram_before)
+                # Restart the browser
                 session.start()
-                # Re-check login after restart (cookies are persisted)
                 username = session.ensure_logged_in()
+                ram_after_restart = get_available_ram_mb()
                 log.info("Browser restarted. RAM available: %.0f MB",
-                         get_available_ram_mb())
+                         ram_after_restart)
             except Exception as exc:
                 log.error("Browser restart failed: %s", exc)
                 log.error("Aborting run to prevent system instability.")
                 aborted_reason = f"browser restart failed: {exc}"
+                break
+
+        # If RAM is getting low but we haven't hit the restart threshold yet,
+        # do an emergency restart to free up memory before the OOM killer fires.
+        ram_now = get_available_ram_mb()
+        if ram_now < MIN_AVAILABLE_RAM_MB * 1.5 and subscribe_count > 0:
+            log.warning("RAM low (%.0f MB) — triggering emergency browser restart...", ram_now)
+            try:
+                session.close()
+                kill_orphaned_chromium()
+                time.sleep(5)
+                session.start()
+                username = session.ensure_logged_in()
+                log.info("Emergency restart done. RAM: %.0f MB", get_available_ram_mb())
+            except Exception as exc:
+                log.error("Emergency restart failed: %s", exc)
+                aborted_reason = f"emergency restart failed: {exc}"
                 break
 
         if not name:

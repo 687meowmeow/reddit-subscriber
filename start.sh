@@ -71,6 +71,34 @@ echo ""
 echo "  Press Ctrl+C to stop."
 echo ""
 
+# --- Step 0: Ensure swap space exists (critical for Pi stability) -----------
+# Chromium is memory-hungry. Without swap, the OOM killer fires and takes
+# down pi-hole, sshd, and other services. With 8GB RAM + 4GB swap, the Pi
+# can handle Chromium's memory spikes without killing system services.
+if [[ "$IS_PI" == "true" || "$OSTYPE" == "linux-gnu"* ]]; then
+    SWAP_SIZE_MB=4096  # 4 GB swap
+    CURRENT_SWAP=$(swapon --show=SIZE --bytes --noheadings 2>/dev/null | awk '{s+=$1} END {print int(s/1048576)}')
+    if [ -z "$CURRENT_SWAP" ] || [ "$CURRENT_SWAP" -lt 1024 ]; then
+        echo "  [setup] Creating ${SWAP_SIZE_MB}MB swap file (prevents OOM kills)..."
+        sudo fallocate -l ${SWAP_SIZE_MB}M /swapfile 2>/dev/null || sudo dd if=/dev/zero of=/swapfile bs=1M count=$SWAP_SIZE_MB status=progress
+        sudo chmod 600 /swapfile
+        sudo mkswap /swapfile 2>&1 | tail -1
+        sudo swapon /swapfile 2>/dev/null || true
+        # Add to fstab so it persists across reboots
+        if ! grep -q '/swapfile' /etc/fstab; then
+            echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab > /dev/null
+        fi
+        # Reduce swappiness (default 60 is too aggressive for Pi)
+        echo 10 | sudo tee /proc/sys/vm/swappiness > /dev/null 2>/dev/null || true
+        if ! grep -q 'vm.swappiness' /etc/sysctl.conf; then
+            echo 'vm.swappiness=10' | sudo tee -a /etc/sysctl.conf > /dev/null
+        fi
+        echo "  [setup] Swap enabled: $(swapon --show --noheadings 2>/dev/null | wc -l) swap device(s)"
+    else
+        echo "  [setup] Swap already active: ${CURRENT_SWAP}MB"
+    fi
+fi
+
 # --- Step 1: Install Python deps (only if missing) -------------------------
 PYTHON_BIN=""
 if command -v python3 >/dev/null 2>&1; then
