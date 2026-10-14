@@ -159,7 +159,7 @@ INTER_ROW_DELAY_MAX    = 30.0
 BATCH_BREAK_EVERY_N    = 25
 BATCH_BREAK_MIN        = 60.0
 BATCH_BREAK_MAX        = 120.0
-MAX_SUBSCRIBES_PER_SESSION = 50  # reduced from 100 — Pi has limited RAM
+MAX_SUBSCRIBES_PER_SESSION = 100  # 8GB Pi can handle 100 per session
 
 # Number of consecutive subscribe failures that triggers a shadowban re-check.
 SHADOWBAN_CHECK_THRESHOLD = 5
@@ -169,12 +169,14 @@ SHADOWBAN_CHECK_THRESHOLD = 5
 # Chromium is notoriously bad at releasing RAM — over thousands of page loads,
 # it can consume all available memory on a Pi, causing the OOM killer to
 # kill sshd, pi-hole, and other critical services.
-BROWSER_RESTART_EVERY_N = 20
+# With 8GB RAM, we can go longer between restarts.
+BROWSER_RESTART_EVERY_N = 30
 
 # Minimum available RAM (in MB) required to continue processing.
 # If the Pi drops below this, we pause and wait for memory to be freed
 # before continuing. This protects pi-hole and sshd from the OOM killer.
-MIN_AVAILABLE_RAM_MB = 100  # 100 MB — if below this, pause
+# With 8GB total, 200 MB is a safe floor (leaves room for system services).
+MIN_AVAILABLE_RAM_MB = 200  # 200 MB — if below this, pause
 
 # Maximum log file size (in MB) before rotation kicks in.
 MAX_LOG_FILE_SIZE_MB = 50
