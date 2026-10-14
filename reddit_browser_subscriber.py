@@ -167,16 +167,14 @@ SHADOWBAN_CHECK_THRESHOLD = 5
 # --- Resource management ---
 # Restart the browser every N subscribes to release Chromium's leaked memory.
 # Chromium is notoriously bad at releasing RAM — over thousands of page loads,
-# it can consume all available memory on a Pi, causing the OOM killer to
-# kill sshd, pi-hole, and other critical services.
-# With 8GB RAM, every 15 subscribes is aggressive but safe.
-BROWSER_RESTART_EVERY_N = 15
+# it can consume all available memory on a Pi.
+# With 8GB RAM, every 30 subscribes is reasonable.
+BROWSER_RESTART_EVERY_N = 30
 
 # Minimum available RAM (in MB) required to continue processing.
-# If the Pi drops below this, we pause and wait for memory to be freed
-# before continuing. This protects pi-hole and sshd from the OOM killer.
-# With 8GB total, 500 MB is a safe floor — leaves plenty for system services.
-MIN_AVAILABLE_RAM_MB = 500  # 500 MB — if below this, pause and wait
+# If the Pi drops below this, we pause and wait for memory to be freed.
+# Set to 200 MB — if we're actually running out of RAM, this will catch it.
+MIN_AVAILABLE_RAM_MB = 200
 
 # Maximum log file size (in MB) before rotation kicks in.
 MAX_LOG_FILE_SIZE_MB = 50
@@ -399,6 +397,93 @@ def rotate_log_if_needed(log_path: Path) -> None:
             log.info("Rotated log file (was %.1f MB). New log starts.", size_mb)
     except Exception as exc:
         log.debug("log rotation error: %s", exc)
+
+
+def get_cpu_temp_c() -> float:
+    """
+    Read the Pi's CPU temperature.
+    Returns 0 on non-Linux or if the file doesn't exist.
+    High CPU temp (>80°C) causes thermal throttling and lockups.
+    """
+    if not sys.platform.startswith("linux"):
+        return 0.0
+    try:
+        with open("/sys/class/thermal/thermal_zone0/temp", "r") as f:
+            return int(f.read().strip()) / 1000.0
+    except Exception:
+        return 0.0
+
+
+def get_load_average() -> tuple:
+    """Return the 1/5/15 minute load average. Returns (0,0,0) on non-Linux."""
+    if not sys.platform.startswith("linux"):
+        return (0.0, 0.0, 0.0)
+    try:
+        return os.getloadavg()
+    except Exception:
+        return (0.0, 0.0, 0.0)
+
+
+def get_open_file_descriptors() -> int:
+    """
+    Count the number of open file descriptors for this process.
+    A leak here would eventually hit the ulimit and cause failures.
+    """
+    try:
+        return len(os.listdir(f"/proc/self/fd"))
+    except Exception:
+        return 0
+
+
+def log_system_health(context: str = "") -> None:
+    """
+    Log a comprehensive snapshot of system health.
+    Call this periodically to diagnose what's actually causing the Pi
+    to become unresponsive.
+
+    Logs:
+    - Available RAM (MB)
+    - CPU temperature (°C) — thermal throttling causes lockups
+    - Load average (1/5/15 min) — high load = CPU starvation
+    - Open file descriptors — leak would hit ulimit
+    - Disk free space (MB)
+    - Number of chrome processes
+    """
+    ram = get_available_ram_mb()
+    temp = get_cpu_temp_c()
+    load1, load5, load15 = get_load_average()
+    fds = get_open_file_descriptors()
+
+    # Count chrome processes
+    chrome_count = 0
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["pgrep", "-c", "-f", "chrome"],
+            capture_output=True, text=True, timeout=3
+        )
+        if result.stdout.strip():
+            chrome_count = int(result.stdout.strip())
+    except Exception:
+        pass
+
+    log.info(
+        "[health] %s | RAM: %.0fMB | CPU: %.1f°C | Load: %.1f/%.1f/%.1f | "
+        "FDs: %d | chrome procs: %d",
+        context, ram, temp, load1, load5, load15, fds, chrome_count
+    )
+
+    # Warn on specific conditions
+    if temp > 80:
+        log.warning("[health] CPU temperature %.1f°C — Pi may be thermally throttling! "
+                    "This causes system lockups.", temp)
+    if load1 > 4.0:
+        log.warning("[health] Load average %.1f is very high — CPU is starved.", load1)
+    if fds > 500:
+        log.warning("[health] %d open file descriptors — possible fd leak.", fds)
+    if chrome_count > 20:
+        log.warning("[health] %d chrome processes running — possible process leak.",
+                    chrome_count)
 
 
 # -------------------------------------------------------------------
@@ -667,35 +752,10 @@ class BrowserSession:
 
         self._playwright = sync_playwright().start()
 
-        # Chromium launch flags — tuned to minimize memory usage on the Pi.
-        # Without these, Chromium spawns multiple processes per page and
-        # leaks RAM until the OOM killer takes down pi-hole and sshd.
         launch_args = [
             "--disable-blink-features=AutomationControlled",
             "--no-first-run",
             "--no-default-browser-check",
-            # --- Memory reduction flags ---
-            "--disable-gpu",                    # no GPU on Pi, saves ~50MB
-            "--disable-software-rasterizer",    # no SW rendering, saves CPU+RAM
-            "--disable-dev-shm-usage",          # use /tmp instead of /dev/shm
-            "--disable-extensions",             # no extension processes
-            "--disable-background-networking",  # no background fetch
-            "--disable-background-timer-throttling",
-            "--disable-backgrounding-occluded-windows",
-            "--disable-renderer-backgrounding",
-            "--disable-features=BackForwardCache,Translate,MediaRouter",
-            "--disable-breakpad",               # no crash reporter
-            "--disable-component-update",       # no updater process
-            "--disable-sync",                   # no sync service
-            "--no-sandbox",                    # skip sandbox (saves RAM)
-            "--disable-session-crashed-bubble",
-            "--disable-infobars",
-            "--disable-notifications",
-            "--disable-popup-blocking",
-            # Limit per-tab memory by forcing a smaller JS heap
-            "--js-flags=--max-old-space-size=128",
-            # Don't let Chromium manage its own memory pressure
-            "--memory-pressure-off",
         ]
 
         self._browser = self._playwright.chromium.launch_persistent_context(
@@ -2083,6 +2143,14 @@ def run_subscribe_pass(
         if not check_internet_connection(timeout=5.0):
             wait_for_internet()
 
+        # --- SYSTEM HEALTH LOGGING ---
+        # Log full system health every 10 subscribes to diagnose what's
+        # actually causing the Pi to become unresponsive over time.
+        # This logs RAM, CPU temp, load average, file descriptors, and
+        # chrome process count.
+        if subscribe_count > 0 and subscribe_count % 10 == 0:
+            log_system_health(f"every 10 subs (count={subscribe_count})")
+
         # --- RESOURCE CHECK ---
         # Check available RAM and disk space. If RAM is low, pause and wait
         # for memory to be freed (protects pi-hole, sshd from OOM killer).
@@ -2120,27 +2188,11 @@ def run_subscribe_pass(
                 ram_after_restart = get_available_ram_mb()
                 log.info("Browser restarted. RAM available: %.0f MB",
                          ram_after_restart)
+                log_system_health("after browser restart")
             except Exception as exc:
                 log.error("Browser restart failed: %s", exc)
                 log.error("Aborting run to prevent system instability.")
                 aborted_reason = f"browser restart failed: {exc}"
-                break
-
-        # If RAM is getting low but we haven't hit the restart threshold yet,
-        # do an emergency restart to free up memory before the OOM killer fires.
-        ram_now = get_available_ram_mb()
-        if ram_now < MIN_AVAILABLE_RAM_MB * 1.5 and subscribe_count > 0:
-            log.warning("RAM low (%.0f MB) — triggering emergency browser restart...", ram_now)
-            try:
-                session.close()
-                kill_orphaned_chromium()
-                time.sleep(5)
-                session.start()
-                username = session.ensure_logged_in()
-                log.info("Emergency restart done. RAM: %.0f MB", get_available_ram_mb())
-            except Exception as exc:
-                log.error("Emergency restart failed: %s", exc)
-                aborted_reason = f"emergency restart failed: {exc}"
                 break
 
         if not name:
@@ -2428,6 +2480,10 @@ def main() -> None:
     log.info("System: %.0f MB RAM available, %.0f MB disk free",
              get_available_ram_mb(), get_disk_free_mb(str(csv_path.parent)))
 
+    # Log full system health at startup — this will help diagnose what's
+    # actually causing the Pi to become unresponsive over time.
+    log_system_health("startup")
+
     # Kill any orphaned Chromium processes from a previous run that crashed.
     # This prevents zombie processes from accumulating and consuming RAM.
     kill_orphaned_chromium()
@@ -2473,6 +2529,7 @@ def main() -> None:
         # takes down pi-hole, sshd, and other critical services.
         kill_orphaned_chromium()
         log.info("Cleanup complete. RAM available: %.0f MB", get_available_ram_mb())
+        log_system_health("exit")
 
 
 if __name__ == "__main__":
