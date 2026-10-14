@@ -289,10 +289,12 @@ export default function Home() {
   }, []);
 
   // Fetch the CSV data
+  // Uses a ref to skip re-rendering if nothing changed (prevents page jumping)
+  const lastCsvDataRef = useRef<string>("");
   const fetchCsvData = useCallback(async (csv: string) => {
     if (!csv) return;
-    setRefreshing(true);
-    setError(null);
+    // Don't set refreshing=true on auto-refresh — it causes the spinner
+    // icon to flash and makes the page feel janky
     try {
       const res = await fetch(`/api/csv-data?csv=${encodeURIComponent(csv)}`);
       const data = await res.json();
@@ -300,11 +302,17 @@ export default function Home() {
         setError(data.error || `HTTP ${res.status}`);
         setCsvData(null);
       } else {
-        setCsvData(data);
+        // Only update state if the data actually changed.
+        // This prevents the entire table (4000+ rows) from re-rendering
+        // every 3 seconds when nothing has changed.
+        const signature = `${data.totalRows}|${JSON.stringify(data.counts)}|${data.lastModified || ""}`;
+        if (signature !== lastCsvDataRef.current) {
+          lastCsvDataRef.current = signature;
+          setCsvData(data);
+        }
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
-      setCsvData(null);
     } finally {
       setRefreshing(false);
       setLastFetch(new Date());
@@ -619,7 +627,10 @@ export default function Home() {
             <Button
               variant="outline"
               size="icon"
-              onClick={() => fetchCsvData(selectedCsv)}
+              onClick={() => {
+                setRefreshing(true);
+                fetchCsvData(selectedCsv);
+              }}
               disabled={refreshing}
               title="Refresh now"
             >
@@ -1732,6 +1743,13 @@ function RunControls({
 
   const handleStart = async () => {
     setStarting(true);
+    // Optimistic update — immediately show "running" state so the UI
+    // feels responsive without waiting for the API response
+    setRunStatus((prev) => prev ? { ...prev, status: "running" } : {
+      status: "running", pid: null, startedAt: new Date().toISOString(),
+      endedAt: null, csv: selectedCsv, error: null, logs: [],
+      totalLogLines: 0, scriptPath: "", csvRoot: "", pythonCmd: "", platform: "",
+    });
     setLogLines([]);
     setLastLogIdx(0);
     lastLogIdxRef.current = 0;
@@ -1753,9 +1771,12 @@ function RunControls({
       });
       const data = await res.json();
       if (!res.ok) {
+        // Revert optimistic update on error
+        setRunStatus((prev) => prev ? { ...prev, status: "error", error: data.error } : prev);
         alert(data.error || "Failed to start");
       }
     } catch (err) {
+      setRunStatus((prev) => prev ? { ...prev, status: "error" } : prev);
       alert(err instanceof Error ? err.message : String(err));
     } finally {
       setStarting(false);
@@ -1764,6 +1785,8 @@ function RunControls({
 
   const handleStop = async () => {
     setStopping(true);
+    // Optimistic update — immediately show "stopped" state
+    setRunStatus((prev) => prev ? { ...prev, status: "stopped" } : prev);
     try {
       await fetch("/api/run", {
         method: "POST",
@@ -1777,6 +1800,8 @@ function RunControls({
 
   const handleContinue = async () => {
     setContinuing(true);
+    // Optimistic update — immediately show "running" state
+    setRunStatus((prev) => prev ? { ...prev, status: "running" } : prev);
     try {
       const res = await fetch("/api/run", {
         method: "POST",

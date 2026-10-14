@@ -1595,12 +1595,44 @@ def subscribe_one(session: BrowserSession, subreddit_name: str) -> Dict[str, str
                     "subscribed_at": "",
                     "scraped": scraped}
 
-        url = SUBREDDIT_URL_TEMPLATE.format(name=urllib.parse.quote(name))
+        # --- URL VARIATION ---
+        # Randomly switch between sh.reddit.com and www.reddit.com.
+        # Always using the same URL is a fingerprint — real users arrive
+        # from search results, links, bookmarks, etc. This doesn't add any
+        # time, it just varies the pattern.
+        if random.random() < 0.3:
+            # 30% of the time, use www.reddit.com (older UI variant)
+            url = f"https://www.reddit.com/r/{urllib.parse.quote(name)}/"
+        else:
+            # 70% of the time, use sh.reddit.com (modern Web Components)
+            url = SUBREDDIT_URL_TEMPLATE.format(name=urllib.parse.quote(name))
+
         page = session.new_page()
         try:
             log.info("  navigating to %s", url)
+
+            # --- RANDOM REFERRER ---
+            # Real users don't always arrive at a subreddit directly.
+            # Sometimes they click from a search result, sometimes from
+            # the Reddit homepage, sometimes from a related subreddit.
+            # This adds zero time but breaks the "always direct navigation"
+            # fingerprint.
+            referrers = [
+                None,  # direct navigation (no referrer) — 50%
+                None,
+                None,
+                "https://www.reddit.com/",  # from Reddit homepage
+                "https://www.reddit.com/",  # from Reddit homepage
+                f"https://www.reddit.com/search/?q={urllib.parse.quote(name)}",  # from search
+            ]
+            chosen_referrer = random.choice(referrers)
+
             try:
-                response = page.goto(url, wait_until="domcontentloaded", timeout=45_000)
+                if chosen_referrer:
+                    response = page.goto(url, wait_until="domcontentloaded",
+                                         timeout=45_000, referer=chosen_referrer)
+                else:
+                    response = page.goto(url, wait_until="domcontentloaded", timeout=45_000)
             except Exception as exc:
                 return {"status": SubscribeResult.FAILED,
                         "error": f"navigation error: {exc}",
@@ -1692,20 +1724,46 @@ def subscribe_one(session: BrowserSession, subreddit_name: str) -> Dict[str, str
                         "subscribed_at": "",
                         "scraped": scraped}
 
-            # Human-like mouse movement before clicking: move to a random
-            # offset within the button, hover, then click.
+            # --- HUMAN-LIKE BEHAVIOR BEFORE CLICKING ---
+            # These add ZERO extra time (they happen during the pre-click
+            # delay we'd do anyway) but make the interaction look much
+            # more human to anti-bot systems.
+
+            # 1. Random scroll — real users scroll the page before clicking.
+            #    This changes the scroll position, viewport, and mouse
+            #    coordinates in ways that fingerprint the interaction as human.
+            try:
+                scroll_y = random.randint(0, 300)
+                page.evaluate(f"window.scrollTo(0, {scroll_y})")
+            except Exception:
+                pass
+
+            # 2. Sometimes move mouse to a random position first (simulate
+            #    "looking around"), then move to the button.
             try:
                 box = join_btn.bounding_box()
                 if box:
-                    # Move mouse to a random point within the button, with steps
-                    # to simulate a real cursor path.
+                    # 40% of the time, do a "wandering" mouse path:
+                    # move to a random spot on the page first, then to button
+                    if random.random() < 0.4:
+                        rand_x = random.uniform(100, 800)
+                        rand_y = random.uniform(100, 600)
+                        page.mouse.move(rand_x, rand_y, steps=random.randint(5, 15))
+
+                    # Move to a random point within the button
                     target_x = box["x"] + box["width"] * random.uniform(0.2, 0.8)
                     target_y = box["y"] + box["height"] * random.uniform(0.2, 0.8)
-                    # Move from current position (whatever it is) to target,
-                    # in 10-20 small steps.
-                    steps = random.randint(10, 20)
+                    # Vary the number of steps (5-25) so it's not always the same
+                    steps = random.randint(5, 25)
                     page.mouse.move(target_x, target_y, steps=steps)
                     sleep_jitter(PRE_CLICK_DELAY_MIN, PRE_CLICK_DELAY_MAX, "pre-click hover")
+
+                    # 3. 15% of the time, do a tiny mouse jiggle at the
+                    #    target (real users' hands aren't perfectly steady)
+                    if random.random() < 0.15:
+                        jiggle_x = target_x + random.uniform(-3, 3)
+                        jiggle_y = target_y + random.uniform(-3, 3)
+                        page.mouse.move(jiggle_x, jiggle_y, steps=3)
             except Exception as exc:
                 log.debug("mouse-move failed (continuing): %s", exc)
 
