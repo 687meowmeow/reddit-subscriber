@@ -148,18 +148,18 @@ RETRYABLE_STATUSES: Set[str] = {"failed", "shadowbanned"}
 
 # Anti-shadowban pacing parameters (seconds).
 # Tuned to mimic a careful human reading the page before clicking.
-PAGE_LOAD_WAIT_MIN     = 4.0
-PAGE_LOAD_WAIT_MAX     = 8.0
-PRE_CLICK_DELAY_MIN    = 2.0
-PRE_CLICK_DELAY_MAX    = 6.0
-POST_CLICK_WAIT_MIN    = 3.0
-POST_CLICK_WAIT_MAX   = 8.0
-INTER_ROW_DELAY_MIN    = 8.0
-INTER_ROW_DELAY_MAX    = 30.0
-BATCH_BREAK_EVERY_N    = 25
-BATCH_BREAK_MIN        = 60.0
-BATCH_BREAK_MAX        = 120.0
-MAX_SUBSCRIBES_PER_SESSION = 100  # 8GB Pi can handle 100 per session
+PAGE_LOAD_WAIT_MIN     = 2.0   # was 4.0 — pages load faster without images/CSS
+PAGE_LOAD_WAIT_MAX     = 5.0   # was 8.0
+PRE_CLICK_DELAY_MIN    = 1.0   # was 2.0
+PRE_CLICK_DELAY_MAX    = 3.0   # was 6.0
+POST_CLICK_WAIT_MIN    = 2.0   # was 3.0 — page loads faster without images/CSS
+POST_CLICK_WAIT_MAX   = 5.0   # was 8.0
+INTER_ROW_DELAY_MIN    = 5.0   # was 8.0 — resource blocking means less server load
+INTER_ROW_DELAY_MAX    = 15.0  # was 30.0 — halved for 2x speedup
+BATCH_BREAK_EVERY_N    = 25    # unchanged
+BATCH_BREAK_MIN        = 30.0  # was 60.0 — shorter batch breaks
+BATCH_BREAK_MAX        = 60.0  # was 120.0
+MAX_SUBSCRIBES_PER_SESSION = 100  # unchanged
 
 # Number of consecutive subscribe failures that triggers a shadowban re-check.
 SHADOWBAN_CHECK_THRESHOLD = 5
@@ -786,77 +786,33 @@ class BrowserSession:
         # Fix: intercept and abort all non-essential resource requests.
         # We only need HTML + JS to find and click the Join button.
         # This cuts connections per page from ~100 to ~5.
+        #
+        # NOTE: We block by RESOURCE TYPE only (image, media, font, stylesheet).
+        # We do NOT block ad/tracking domains by name — that's detectable
+        # (ad-blocker detection scripts check if their scripts were blocked).
+        # The user's pi-hole handles ad blocking at the DNS level, which
+        # is NOT detectable by the website.
         # ----------------------------------------------------------------
         BLOCKED_RESOURCE_TYPES = {
             "image",        # all images (icons, thumbnails, banners)
-            "media",        # video, audio
-            "font",         # web fonts (woff, woff2, ttf)
+            "media",         # video, audio
+            "font",          # web fonts (woff, woff2, ttf)
             "stylesheet",   # CSS files (we don't need styles to find a button)
         }
 
-        # Domains to block entirely (ads, analytics, tracking)
-        BLOCKED_DOMAINS = {
-            "doubleclick.net",
-            "googlesyndication.com",
-            "google-analytics.com",
-            "googletagmanager.com",
-            "amazon-adsystem.com",
-            "adsystem.com",
-            "scorecardresearch.com",
-            "quantserve.com",
-            "adnxs.com",
-            "criteo.com",
-            "taboola.com",
-            "outbrain.com",
-            "adsrvr.org",
-            "pubmatic.com",
-            "rubiconproject.com",
-            "openx.net",
-            "casalemedia.com",
-            "moatads.com",
-            "adservice.google.com",
-            "cdn.branch.io",
-            "analytics.reddit.com",
-            "events.reddit.com",
-            "stats.g.doubleclick.net",
-        }
-
-        def _should_block(route):
-            """Return True if this request should be blocked."""
-            try:
-                url = route.request.url
-                resource_type = route.request.resource_type
-
-                # Block by resource type
-                if resource_type in BLOCKED_RESOURCE_TYPES:
-                    return True
-
-                # Block by domain
-                url_lower = url.lower()
-                for domain in BLOCKED_DOMAINS:
-                    if domain in url_lower:
-                        return True
-
-                return False
-            except Exception:
-                return False
-
         def _handle_route(route):
             """Playwright route handler — aborts non-essential requests."""
-            if _should_block(route):
-                try:
+            try:
+                if route.request.resource_type in BLOCKED_RESOURCE_TYPES:
                     route.abort()
-                except Exception:
-                    pass
-            else:
-                try:
+                else:
                     route.continue_()
-                except Exception:
-                    pass
+            except Exception:
+                pass
 
         try:
             self._browser.route("**/*", _handle_route)
-            log.info("Resource blocking enabled (images, CSS, fonts, ads blocked)")
+            log.info("Resource blocking enabled (images, CSS, fonts, media blocked)")
         except Exception as exc:
             log.warning("Failed to set up resource blocking: %s", exc)
 
@@ -2233,12 +2189,12 @@ def run_subscribe_pass(
             log_system_health(f"every 10 subs (count={subscribe_count})")
 
             # --- NETWORK COOLDOWN ---
-            # Every 10 subscribes, pause for 2 minutes to let all TCP
-            # connections fully close. Without this, connections accumulate
-            # in TIME_WAIT state and eventually crash the Pi's network
-            # interface (taking down SSH, VNC, and pi-hole).
-            log.info("Network cooldown — pausing 120s to let TCP connections close...")
-            time.sleep(120)
+            # Every 10 subscribes, pause for 60 seconds to let any remaining
+            # TCP connections close. With resource blocking enabled, each
+            # page only opens ~5 connections (vs ~100 without blocking),
+            # so a shorter cooldown is sufficient.
+            log.info("Network cooldown — pausing 60s to let TCP connections close...")
+            time.sleep(60)
             log.info("Cooldown complete. Continuing.")
 
         # --- RESOURCE CHECK ---
