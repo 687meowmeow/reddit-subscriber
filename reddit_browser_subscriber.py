@@ -159,10 +159,25 @@ INTER_ROW_DELAY_MAX    = 30.0
 BATCH_BREAK_EVERY_N    = 25
 BATCH_BREAK_MIN        = 60.0
 BATCH_BREAK_MAX        = 120.0
-MAX_SUBSCRIBES_PER_SESSION = 100  # hard cap — abort after this many
+MAX_SUBSCRIBES_PER_SESSION = 50  # reduced from 100 — Pi has limited RAM
 
 # Number of consecutive subscribe failures that triggers a shadowban re-check.
 SHADOWBAN_CHECK_THRESHOLD = 5
+
+# --- Resource management ---
+# Restart the browser every N subscribes to release Chromium's leaked memory.
+# Chromium is notoriously bad at releasing RAM — over thousands of page loads,
+# it can consume all available memory on a Pi, causing the OOM killer to
+# kill sshd, pi-hole, and other critical services.
+BROWSER_RESTART_EVERY_N = 20
+
+# Minimum available RAM (in MB) required to continue processing.
+# If the Pi drops below this, we pause and wait for memory to be freed
+# before continuing. This protects pi-hole and sshd from the OOM killer.
+MIN_AVAILABLE_RAM_MB = 100  # 100 MB — if below this, pause
+
+# Maximum log file size (in MB) before rotation kicks in.
+MAX_LOG_FILE_SIZE_MB = 50
 
 # Subreddit URL pattern. sh.reddit.com is the modern UI; uses Web Components.
 SUBREDDIT_URL_TEMPLATE = "https://sh.reddit.com/r/{name}/"
@@ -235,6 +250,129 @@ def wait_if_paused() -> None:
     while os.path.exists(PAUSE_FLAG_FILE):
         time.sleep(2.0)
     log.info("Pause flag removed — resuming.")
+
+
+# -------------------------------------------------------------------
+# Resource monitoring — protect the Pi from OOM kills
+# -------------------------------------------------------------------
+
+def get_available_ram_mb() -> float:
+    """
+    Read /proc/meminfo to get available RAM in MB.
+    Returns 9999 on non-Linux platforms (so the check is skipped).
+    """
+    if not sys.platform.startswith("linux"):
+        return 9999.0
+    try:
+        with open("/proc/meminfo", "r") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    # Format: "MemAvailable:  1234567 kB"
+                    parts = line.split()
+                    return int(parts[1]) / 1024.0
+    except Exception:
+        pass
+    return 9999.0
+
+
+def get_disk_free_mb(dir_path: str = ".") -> float:
+    """
+    Get free disk space in MB for the given directory.
+    Returns 9999 on error.
+    """
+    try:
+        stat = os.statvfs(dir_path)
+        return (stat.f_bavail * stat.f_frsize) / (1024 * 1024)
+    except Exception:
+        return 9999.0
+
+
+def check_system_resources(csv_path_str: str = ".") -> bool:
+    """
+    Check if the system has enough resources to continue.
+    Returns True if OK to continue, False if we should pause.
+
+    Checks:
+    1. Available RAM — if below MIN_AVAILABLE_RAM_MB, pause and wait
+    2. Free disk space — if below 500 MB, abort (can't write status CSV)
+
+    This protects pi-hole, sshd, and other services from the OOM killer.
+    """
+    # Check disk space first — if we can't write, there's no point continuing
+    disk_free = get_disk_free_mb(csv_path_str)
+    if disk_free < 500:
+        log.error("CRITICAL: Only %.0f MB disk space free at %s. "
+                  "Aborting to prevent filesystem corruption.",
+                  disk_free, csv_path_str)
+        return False
+
+    # Check RAM
+    available = get_available_ram_mb()
+    if available < MIN_AVAILABLE_RAM_MB:
+        log.warning("LOW MEMORY: only %.0f MB RAM available (minimum: %d MB). "
+                    "Pausing to protect system services (pi-hole, sshd).",
+                    available, MIN_AVAILABLE_RAM_MB)
+        # Wait for memory to be freed. Check every 30 seconds.
+        while available < MIN_AVAILABLE_RAM_MB:
+            log.info("  RAM: %.0f MB free — waiting 30s for memory to be freed...",
+                     available)
+            time.sleep(30)
+            available = get_available_ram_mb()
+        log.info("RAM recovered: %.0f MB available. Continuing.", available)
+
+    return True
+
+
+def kill_orphaned_chromium() -> int:
+    """
+    Kill any orphaned Chromium/chrome processes left over from previous runs.
+    Returns the number of processes killed.
+
+    This is called at startup and on exit to prevent zombie processes from
+    accumulating and consuming RAM.
+    """
+    killed = 0
+    if not sys.platform.startswith("linux"):
+        return killed
+    try:
+        import subprocess
+        # Find chromium/chrome processes (but not our own subprocess tree)
+        result = subprocess.run(
+            ["pgrep", "-f", "chrome-linux-arm64/chrome"],
+            capture_output=True, text=True, timeout=5
+        )
+        pids = result.stdout.strip().split("\n") if result.stdout.strip() else []
+        for pid_str in pids:
+            pid = pid_str.strip()
+            if not pid:
+                continue
+            try:
+                os.kill(int(pid), 9)  # SIGKILL
+                killed += 1
+            except (ProcessLookupError, ValueError, PermissionError):
+                pass
+        if killed > 0:
+            log.info("Killed %d orphaned Chromium process(es).", killed)
+    except Exception as exc:
+        log.debug("kill_orphaned_chromium error: %s", exc)
+    return killed
+
+
+def rotate_log_if_needed(log_path: Path) -> None:
+    """
+    If the log file exceeds MAX_LOG_FILE_SIZE_MB, rotate it:
+    rename to .1 and start a new file. Keeps only one backup.
+    """
+    try:
+        size_mb = log_path.stat().st_size / (1024 * 1024)
+        if size_mb > MAX_LOG_FILE_SIZE_MB:
+            backup = log_path.with_suffix(log_path.suffix + ".1")
+            if backup.exists():
+                backup.unlink()
+            log_path.rename(backup)
+            log.info("Rotated log file (was %.1f MB). New log starts.", size_mb)
+    except Exception as exc:
+        log.debug("log rotation error: %s", exc)
 
 
 # -------------------------------------------------------------------
@@ -1869,6 +2007,39 @@ def run_subscribe_pass(
         if not check_internet_connection(timeout=5.0):
             wait_for_internet()
 
+        # --- RESOURCE CHECK ---
+        # Check available RAM and disk space. If RAM is low, pause and wait
+        # for memory to be freed (protects pi-hole, sshd from OOM killer).
+        # If disk is critically low, abort the run entirely.
+        if not check_system_resources(str(csv_path.parent)):
+            log.error("Aborting run due to low system resources.")
+            aborted_reason = "low system resources (disk full)"
+            break
+
+        # --- BROWSER RESTART ---
+        # Restart the browser every BROWSER_RESTART_EVERY_N subscribes to
+        # release Chromium's leaked memory. Without this, Chromium
+        # accumulates RAM over thousands of page loads and eventually
+        # triggers the OOM killer, which takes down pi-hole and sshd.
+        if subscribe_count > 0 and subscribe_count % BROWSER_RESTART_EVERY_N == 0:
+            log.info("Restarting browser to release memory (every %d subscribes)...",
+                     BROWSER_RESTART_EVERY_N)
+            try:
+                session.close()
+                time.sleep(3)
+                kill_orphaned_chromium()
+                time.sleep(2)
+                session.start()
+                # Re-check login after restart (cookies are persisted)
+                username = session.ensure_logged_in()
+                log.info("Browser restarted. RAM available: %.0f MB",
+                         get_available_ram_mb())
+            except Exception as exc:
+                log.error("Browser restart failed: %s", exc)
+                log.error("Aborting run to prevent system instability.")
+                aborted_reason = f"browser restart failed: {exc}"
+                break
+
         if not name:
             row[STATUS_COL]        = SubscribeResult.NOT_FOUND
             row[ERROR_COL]         = "empty subreddit name"
@@ -2151,6 +2322,15 @@ def main() -> None:
     log.info("Profile:    %s", profile_dir)
     log.info("Subreddit column detected: '%s'", sub_col)
     log.info("Total rows: %d", len(rows))
+    log.info("System: %.0f MB RAM available, %.0f MB disk free",
+             get_available_ram_mb(), get_disk_free_mb(str(csv_path.parent)))
+
+    # Kill any orphaned Chromium processes from a previous run that crashed.
+    # This prevents zombie processes from accumulating and consuming RAM.
+    kill_orphaned_chromium()
+
+    # Rotate the log file if it's gotten too large
+    rotate_log_if_needed(log_path)
 
     if args.reprocess_failed:
         reset = 0
@@ -2180,7 +2360,16 @@ def main() -> None:
         log.info("Done. Status CSV: %s", status_path)
         log.info("Input CSV was NOT modified: %s", csv_path)
     finally:
-        session.close()
+        try:
+            session.close()
+        except Exception:
+            pass
+        # Kill any Chromium processes that didn't shut down cleanly.
+        # This is critical on the Pi — orphaned Chromium processes
+        # accumulate RAM and eventually trigger the OOM killer, which
+        # takes down pi-hole, sshd, and other critical services.
+        kill_orphaned_chromium()
+        log.info("Cleanup complete. RAM available: %.0f MB", get_available_ram_mb())
 
 
 if __name__ == "__main__":
