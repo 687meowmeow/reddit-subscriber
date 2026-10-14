@@ -2189,12 +2189,15 @@ def run_subscribe_pass(
             log_system_health(f"every 10 subs (count={subscribe_count})")
 
             # --- NETWORK COOLDOWN ---
-            # Every 10 subscribes, pause for 60 seconds to let any remaining
-            # TCP connections close. With resource blocking enabled, each
-            # page only opens ~5 connections (vs ~100 without blocking),
-            # so a shorter cooldown is sufficient.
-            log.info("Network cooldown — pausing 60s to let TCP connections close...")
-            time.sleep(60)
+            # Every 10 subscribes, pause briefly to let TCP connections close.
+            # With resource blocking enabled (images/CSS/fonts/ads blocked),
+            # we only open ~5 connections per page instead of ~100, so a
+            # shorter cooldown is sufficient.
+            # Fast/turbo modes use a longer cooldown since connections
+            # accumulate faster.
+            cooldown = 30 if speed_mult >= 1.0 else 60
+            log.info("Network cooldown — pausing %ds to let TCP connections close...", cooldown)
+            time.sleep(cooldown)
             log.info("Cooldown complete. Continuing.")
 
         # --- RESOURCE CHECK ---
@@ -2482,11 +2485,56 @@ Examples
                    help="Force the manual login prompt even if already logged in.")
     p.add_argument("--verbose", action="store_true",
                    help="Enable debug logging.")
+    p.add_argument("--fast", action="store_true",
+                   help="Fast mode: reduce all delays by ~60%% for faster processing. "
+                        "Higher shadowban risk — use with caution. Cuts row time from "
+                        "~50s to ~20s. Still keeps random jitter to look human.")
+    p.add_argument("--turbo", action="store_true",
+                   help="Turbo mode: reduce all delays by ~80%%. Very high shadowban "
+                        "risk — only use on burner accounts you don't care about. "
+                        "Cuts row time from ~50s to ~10s.")
     return p
 
 
 def main() -> None:
+    global PAGE_LOAD_WAIT_MIN, PAGE_LOAD_WAIT_MAX
+    global PRE_CLICK_DELAY_MIN, PRE_CLICK_DELAY_MAX
+    global POST_CLICK_WAIT_MIN, POST_CLICK_WAIT_MAX
+    global INTER_ROW_DELAY_MIN, INTER_ROW_DELAY_MAX
+    global BATCH_BREAK_MIN, BATCH_BREAK_MAX
+    global BROWSER_RESTART_EVERY_N
+
     args = build_arg_parser().parse_args()
+
+    # --- Speed modes ---
+    # --fast: reduce delays by ~60% (row time ~50s → ~20s)
+    # --turbo: reduce delays by ~80% (row time ~50s → ~10s)
+    if args.turbo:
+        speed_mult = 0.2
+        log.warning("TURBO MODE ENABLED — very high shadowban risk!")
+        log.warning("Only use on burner accounts you don't care about.")
+    elif args.fast:
+        speed_mult = 0.4
+        log.warning("FAST MODE ENABLED — higher shadowban risk.")
+    else:
+        speed_mult = 1.0
+
+    if speed_mult < 1.0:
+        PAGE_LOAD_WAIT_MIN    *= speed_mult
+        PAGE_LOAD_WAIT_MAX     *= speed_mult
+        PRE_CLICK_DELAY_MIN    *= speed_mult
+        PRE_CLICK_DELAY_MAX     *= speed_mult
+        POST_CLICK_WAIT_MIN    *= speed_mult
+        POST_CLICK_WAIT_MAX     *= speed_mult
+        INTER_ROW_DELAY_MIN    *= speed_mult
+        INTER_ROW_DELAY_MAX     *= speed_mult
+        BATCH_BREAK_MIN        *= speed_mult
+        BATCH_BREAK_MAX         *= speed_mult
+        # Restart browser more often in fast modes (memory builds up faster)
+        BROWSER_RESTART_EVERY_N = max(10, int(BROWSER_RESTART_EVERY_N * speed_mult))
+        log.info("Speed multiplier: %.1f (delays reduced to %.0f%% of normal)",
+                 speed_mult, speed_mult * 100)
+        log.info("  Expected row time: ~%.0fs", 50 * speed_mult)
 
     csv_path = Path(args.csv).expanduser().resolve()
     if not csv_path.exists():

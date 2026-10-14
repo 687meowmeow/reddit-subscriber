@@ -230,6 +230,12 @@ export async function POST(request: NextRequest) {
     if (body.maxSubscribes) {
       args.push("--max-subscribes", String(body.maxSubscribes));
     }
+    // Speed modes — reduce delays for faster processing
+    if (body.speedMode === "turbo") {
+      args.push("--turbo");
+    } else if (body.speedMode === "fast") {
+      args.push("--fast");
+    }
 
     // --- Display detection ---
     // On the Pi, Chromium needs a display to run in headed mode. If the

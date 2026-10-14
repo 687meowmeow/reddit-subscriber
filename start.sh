@@ -83,17 +83,30 @@ echo ""
 #    traffic. Default is 16384, we increase to 65536.
 #
 if [[ "$IS_PI" == "true" || "$OSTYPE" == "linux-gnu"* ]]; then
-    # 1. Disable Wi-Fi power management
+    # 1. Disable Wi-Fi power management (multiple methods for compatibility)
+    # Method A: iw (modern)
     if command -v iw >/dev/null 2>&1; then
-        # Find Wi-Fi interfaces and disable power save on each
         for iface in $(iw dev 2>/dev/null | grep Interface | awk '{print $2}'); do
             iw dev "$iface" set power_save off 2>/dev/null && \
-                echo "  [net] Disabled Wi-Fi power save on $iface"
+                echo "  [net] Disabled Wi-Fi power save on $iface (via iw)"
         done
-        # Make it persistent via NetworkManager if available
-        if command -v nmcli >/dev/null 2>&1; then
-            nmcli connection modify --all 802-11-wireless.powersave 2 2>/dev/null || true
-        fi
+    fi
+    # Method B: iwconfig (older, works on some Pi models where iw doesn't)
+    if command -v iwconfig >/dev/null 2>&1; then
+        for iface in $(iwconfig 2>/dev/null | grep -oP '^\w+' | grep -v lo | grep -v eth); do
+            iwconfig "$iface" power off 2>/dev/null && \
+                echo "  [net] Disabled Wi-Fi power save on $iface (via iwconfig)"
+        done
+    fi
+    # Method C: NetworkManager (if available)
+    if command -v nmcli >/dev/null 2>&1; then
+        nmcli connection modify --all 802-11-wireless.powersave 2 2>/dev/null || true
+    fi
+    # Make it persistent via rc.local
+    if ! grep -q 'power_save off' /etc/rc.local 2>/dev/null; then
+        echo 'iw dev wlan0 set power_save off 2>/dev/null || iwconfig wlan0 power off 2>/dev/null' | \
+            sudo tee -a /etc/rc.local > /dev/null 2>/dev/null || true
+        sudo chmod +x /etc/rc.local 2>/dev/null || true
     fi
 
     # 2. Increase conntrack table size

@@ -1610,6 +1610,7 @@ function RunControls({
     verifyOnly: false,
     reprocessFailed: false,
     maxSubscribes: 100,
+    speedMode: "normal" as "normal" | "fast" | "turbo",
   });
   const [showOptions, setShowOptions] = useState(false);
   const [redditUsername, setRedditUsername] = useState("");
@@ -1745,6 +1746,7 @@ function RunControls({
           verifyOnly: options.verifyOnly,
           reprocessFailed: options.reprocessFailed,
           maxSubscribes: options.maxSubscribes,
+          speedMode: options.speedMode,
           redditUsername: redditUsername || undefined,
           redditPassword: redditPassword || undefined,
         }),
@@ -2074,6 +2076,50 @@ function RunControls({
                   className="w-20 h-7 text-xs"
                 />
               </div>
+            </div>
+
+            {/* Speed mode selector */}
+            <div className="flex items-center gap-2 pt-2 border-t border-slate-200 dark:border-slate-800">
+              <Label className="text-xs font-medium">Speed:</Label>
+              <div className="flex gap-1">
+                <Button
+                  size="sm"
+                  variant={options.speedMode === "normal" ? "default" : "outline"}
+                  onClick={() => setOptions({ ...options, speedMode: "normal" })}
+                  className="h-7 text-xs"
+                  title="Normal speed — safe, ~50s per row, lowest shadowban risk"
+                >
+                  Normal
+                </Button>
+                <Button
+                  size="sm"
+                  variant={options.speedMode === "fast" ? "default" : "outline"}
+                  onClick={() => setOptions({ ...options, speedMode: "fast" })}
+                  className={cn("h-7 text-xs", options.speedMode === "fast" && "bg-amber-600 hover:bg-amber-700 text-white")}
+                  title="Fast mode — ~20s per row, higher shadowban risk"
+                >
+                  Fast
+                </Button>
+                <Button
+                  size="sm"
+                  variant={options.speedMode === "turbo" ? "default" : "outline"}
+                  onClick={() => setOptions({ ...options, speedMode: "turbo" })}
+                  className={cn("h-7 text-xs", options.speedMode === "turbo" && "bg-red-600 hover:bg-red-700 text-white")}
+                  title="Turbo mode — ~10s per row, VERY high shadowban risk. Use only on throwaway accounts."
+                >
+                  Turbo
+                </Button>
+              </div>
+              {options.speedMode === "fast" && (
+                <span className="text-[10px] text-amber-600 dark:text-amber-400 ml-2">
+                  ~3x faster, higher shadowban risk
+                </span>
+              )}
+              {options.speedMode === "turbo" && (
+                <span className="text-[10px] text-red-600 dark:text-red-400 ml-2">
+                  ~5x faster, VERY high shadowban risk — burner only!
+                </span>
+              )}
             </div>
             {runStatus?.scriptPath && (
               <p className="text-xs text-slate-500 font-mono">
