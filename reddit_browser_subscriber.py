@@ -2127,6 +2127,7 @@ def run_subscribe_pass(
     fieldnames: List[str],
     rows: List[Dict[str, str]],
     max_subscribes: int = MAX_SUBSCRIBES_PER_SESSION,
+    speed_mult: float = 1.0,
 ) -> None:
     """Iterate CSV and subscribe to each pending row.
 
@@ -2663,7 +2664,8 @@ def main() -> None:
         if not args.verify_only:
             # Pass status_path (NOT csv_path) as the file to write to.
             run_subscribe_pass(session, username, status_path, sub_col, fieldnames, rows,
-                               max_subscribes=args.max_subscribes)
+                               max_subscribes=args.max_subscribes,
+                               speed_mult=speed_mult)
 
         if not args.subscribe_only:
             run_verify_pass(session, status_path, sub_col, fieldnames, rows)
