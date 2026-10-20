@@ -1617,12 +1617,18 @@ function RunControls({
   const [stopping, setStopping] = useState(false);
   const [continuing, setContinuing] = useState(false);
   const [logsCopied, setLogsCopied] = useState(false);
-  const [options, setOptions] = useState({
+  const [options, setOptions] = useState<{
+    headless: boolean;
+    verifyOnly: boolean;
+    reprocessFailed: boolean;
+    maxSubscribes: number | "";
+    speedMode: "normal" | "fast" | "turbo";
+  }>({
     headless: false,
     verifyOnly: false,
     reprocessFailed: false,
     maxSubscribes: 100,
-    speedMode: "normal" as "normal" | "fast" | "turbo",
+    speedMode: "normal",
   });
   const [showOptions, setShowOptions] = useState(false);
   const [redditUsername, setRedditUsername] = useState("");
@@ -1764,7 +1770,9 @@ function RunControls({
           headless: options.headless,
           verifyOnly: options.verifyOnly,
           reprocessFailed: options.reprocessFailed,
-          maxSubscribes: options.maxSubscribes,
+          maxSubscribes: typeof options.maxSubscribes === "number" && options.maxSubscribes > 0
+            ? options.maxSubscribes
+            : 100,
           speedMode: options.speedMode,
           redditUsername: redditUsername || undefined,
           redditPassword: redditPassword || undefined,
@@ -2146,9 +2154,27 @@ function RunControls({
                   type="number"
                   id="opt-max"
                   value={options.maxSubscribes}
-                  onChange={(e) =>
-                    setOptions({ ...options, maxSubscribes: parseInt(e.target.value) || 100 })
-                  }
+                  onChange={(e) => {
+                    // Allow empty string while typing (don't force 100)
+                    const raw = e.target.value;
+                    if (raw === "") {
+                      setOptions({ ...options, maxSubscribes: "" });
+                    } else {
+                      const parsed = parseInt(raw);
+                      // Only update if it's a valid number — don't fall back to 100
+                      if (!isNaN(parsed) && parsed >= 0) {
+                        setOptions({ ...options, maxSubscribes: parsed });
+                      }
+                    }
+                  }}
+                  onBlur={() => {
+                    // When the field loses focus, ensure we have a valid number
+                    const val = options.maxSubscribes;
+                    if (val === "" || val === undefined || (typeof val === "number" && val < 1)) {
+                      setOptions({ ...options, maxSubscribes: 100 });
+                    }
+                  }}
+                  min={1}
                   className="w-20 h-7 text-xs"
                 />
               </div>
