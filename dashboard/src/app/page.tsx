@@ -9,7 +9,7 @@ import {
   CheckCircle2, XCircle, AlertCircle, Clock, Users, RefreshCw, Search,
   Loader2, FileText, Activity, Ban, Lock, ShieldAlert, Eye, EyeOff,
   ChevronDown, Filter, ExternalLink, Bug, Play, Square, Terminal, Settings,
-  Github, Upload,
+  Github, Upload, Copy, Check,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -1616,6 +1616,7 @@ function RunControls({
   const [starting, setStarting] = useState(false);
   const [stopping, setStopping] = useState(false);
   const [continuing, setContinuing] = useState(false);
+  const [logsCopied, setLogsCopied] = useState(false);
   const [options, setOptions] = useState({
     headless: false,
     verifyOnly: false,
@@ -1817,6 +1818,34 @@ function RunControls({
     }
   };
 
+  // Copy all log lines to clipboard
+  const handleCopyLogs = async () => {
+    const text = logLines
+      .map((line) =>
+        `[${new Date(line.timestamp).toLocaleTimeString(undefined, { hour12: false })}] ${line.stream === "stderr" ? "WARN" : "INFO"} ${line.text}`
+      )
+      .join("\n");
+    try {
+      await navigator.clipboard.writeText(text);
+      setLogsCopied(true);
+      setTimeout(() => setLogsCopied(false), 2000);
+    } catch {
+      // Fallback for older browsers / non-secure contexts
+      const textarea = document.createElement("textarea");
+      textarea.value = text;
+      textarea.style.position = "fixed";
+      textarea.style.opacity = "0";
+      document.body.appendChild(textarea);
+      textarea.select();
+      try {
+        document.execCommand("copy");
+        setLogsCopied(true);
+        setTimeout(() => setLogsCopied(false), 2000);
+      } catch {}
+      document.body.removeChild(textarea);
+    }
+  };
+
   const isRunning =
     runStatus?.status === "running" || runStatus?.status === "waiting-for-login";
   const isWaiting = runStatus?.status === "waiting-for-login";
@@ -2008,6 +2037,28 @@ function RunControls({
               <Square className="w-4 h-4 mr-2" />
             )}
             Stop
+          </Button>
+
+          {/* Copy logs button */}
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={handleCopyLogs}
+            disabled={logLines.length === 0}
+            className="gap-1.5"
+            title="Copy all log lines to clipboard"
+          >
+            {logsCopied ? (
+              <>
+                <Check className="w-3.5 h-3.5 text-emerald-500" />
+                Copied!
+              </>
+            ) : (
+              <>
+                <Copy className="w-3.5 h-3.5" />
+                Copy Logs
+              </>
+            )}
           </Button>
 
           {/* Clear logs button */}

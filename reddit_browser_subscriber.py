@@ -134,7 +134,7 @@ DEFAULT_INPUT_COLS: Tuple[str, ...] = (
 )
 
 # Statuses that mean "we already handled this row, don't redo work".
-DONE_STATUSES: Set[str] = {"subscribed", "already_subscribed"}
+DONE_STATUSES: Set[str] = {"subscribed", "already_subscribed", "followed", "already_followed"}
 
 # Statuses that are non-retryable (the subreddit itself is the problem).
 TERMINAL_STATUSES: Set[str] = {
@@ -1295,6 +1295,8 @@ class SubscribeResult:
     """Outcome of a single subscribe attempt."""
     SUBSCRIBED         = "subscribed"
     ALREADY_SUBSCRIBED = "already_subscribed"
+    FOLLOWED           = "followed"
+    ALREADY_FOLLOWED   = "already_followed"
     NOT_FOUND          = "not_found"
     BANNED             = "banned"
     PRIVATE            = "private"
@@ -1370,6 +1372,124 @@ def _find_join_button(page) -> Optional[object]:
         except Exception:
             continue
     return None
+
+
+def _is_user_profile(name: str, page) -> bool:
+    """
+    Detect if this is a user profile page (r/u_username) rather than a
+    subreddit. User profiles have a Follow button instead of Join.
+
+    Detection methods:
+    1. Name starts with 'u_' (the user's CSV convention)
+    2. Page URL contains /user/ (Reddit's user profile URL)
+    3. Page has a shreddit-user-profile-header component
+    4. Page text contains 'u/' profile indicators
+    """
+    # Method 1: name-based check (most reliable for this user's CSV)
+    if name.startswith("u_") or name.startswith("u/"):
+        return True
+
+    # Method 2: URL check
+    try:
+        url = page.url.lower()
+        if "/user/" in url or "/u/" in url:
+            return True
+    except Exception:
+        pass
+
+    # Method 3: DOM check for user profile components
+    try:
+        if page.locator("shreddit-user-profile-header, [data-testid='user-profile-header']").count() > 0:
+            return True
+    except Exception:
+        pass
+
+    return False
+
+
+def _find_follow_button(page) -> Optional[object]:
+    """
+    Locate the Follow button on a user profile page.
+    Returns the element handle, or None if not found.
+
+    Reddit user profiles use 'Follow' instead of 'Join'.
+    The button is in a different component than the subreddit Join button.
+    """
+    selectors = [
+        # sh.reddit.com — Follow button in user profile header
+        'shreddit-user-profile-header button[aria-label*="Follow" i]',
+        'shreddit-user-profile-header button:has-text("Follow")',
+        # New reddit (www.reddit.com) — Follow button
+        'button[aria-label*="follow" i]:not([aria-label*="following" i])',
+        'button[data-testid="follow-button"]',
+        # Generic fallback — any button whose text is "Follow"
+        'button:has-text("Follow")',
+    ]
+
+    for sel in selectors:
+        try:
+            loc = page.locator(sel).first
+            if loc.count() == 0:
+                continue
+            try:
+                if loc.is_visible(timeout=2000):
+                    return loc
+            except Exception:
+                continue
+        except Exception:
+            continue
+    return None
+
+
+def _find_already_following_indicator(page) -> bool:
+    """
+    Detect if the user is already following this profile.
+    Called before attempting to click Follow.
+    """
+    already_indicators = [
+        'button[aria-label*="Following" i]',
+        'button:has-text("Following")',
+        'button[data-testid="unfollow-button"]',
+        'button[aria-label*="Unfollow" i]',
+    ]
+    for sel in already_indicators:
+        try:
+            loc = page.locator(sel).first
+            if loc.count() > 0:
+                try:
+                    if loc.is_visible(timeout=1000):
+                        return True
+                except Exception:
+                    return True
+        except Exception:
+            continue
+
+    # JavaScript check — look for "following" state in page data
+    try:
+        is_following = page.evaluate(
+            """
+            () => {
+                const scripts = document.querySelectorAll('script[type="application/json"]');
+                for (const s of scripts) {
+                    try {
+                        const text = s.textContent || '';
+                        if (text.includes('"is_followed":true') ||
+                            text.includes('"isFollowing":true') ||
+                            text.includes('"user_is_following":true')) {
+                            return true;
+                        }
+                    } catch (e) {}
+                }
+                return false;
+            }
+            """
+        )
+        if is_following:
+            return True
+    except Exception:
+        pass
+
+    return False
 
 
 def _find_already_joined_indicator(page) -> bool:
@@ -1595,17 +1715,28 @@ def subscribe_one(session: BrowserSession, subreddit_name: str) -> Dict[str, str
                     "subscribed_at": "",
                     "scraped": scraped}
 
-        # --- URL VARIATION ---
-        # Randomly switch between sh.reddit.com and www.reddit.com.
-        # Always using the same URL is a fingerprint — real users arrive
-        # from search results, links, bookmarks, etc. This doesn't add any
-        # time, it just varies the pattern.
-        if random.random() < 0.3:
-            # 30% of the time, use www.reddit.com (older UI variant)
-            url = f"https://www.reddit.com/r/{urllib.parse.quote(name)}/"
+        # --- URL VARIATION + USER PROFILE HANDLING ---
+        # For user profiles (name starts with u_), use /user/ instead of /r/
+        # and strip the u_ prefix to get the actual username.
+        is_profile_name = name.startswith("u_") or name.startswith("u/")
+
+        if is_profile_name:
+            # Extract the actual username (strip u_ or u/ prefix)
+            if name.startswith("u_"):
+                profile_name = name[2:]
+            else:
+                profile_name = name[2:]
+            # User profiles always use /user/ path
+            if random.random() < 0.3:
+                url = f"https://www.reddit.com/user/{urllib.parse.quote(profile_name)}/"
+            else:
+                url = f"https://sh.reddit.com/user/{urllib.parse.quote(profile_name)}/"
         else:
-            # 70% of the time, use sh.reddit.com (modern Web Components)
-            url = SUBREDDIT_URL_TEMPLATE.format(name=urllib.parse.quote(name))
+            # Regular subreddit — randomly switch between sh and www
+            if random.random() < 0.3:
+                url = f"https://www.reddit.com/r/{urllib.parse.quote(name)}/"
+            else:
+                url = SUBREDDIT_URL_TEMPLATE.format(name=urllib.parse.quote(name))
 
         page = session.new_page()
         try:
@@ -1679,12 +1810,129 @@ def subscribe_one(session: BrowserSession, subreddit_name: str) -> Dict[str, str
             try:
                 page.wait_for_selector(
                     "shreddit-subreddit-header-buttons, .subreddit-header, "
-                    "button[aria-label*='Join' i], button[aria-label*='Joined' i]",
+                    "shreddit-user-profile-header, "
+                    "button[aria-label*='Join' i], button[aria-label*='Joined' i], "
+                    "button[aria-label*='Follow' i], button[aria-label*='Following' i]",
                     timeout=15_000,
                 )
             except Exception:
                 log.debug("header component not detected within 15s")
 
+            # --- DETECT USER PROFILE vs SUBREDDIT ---
+            # User profiles (r/u_username) have a Follow button, not Join.
+            is_profile = _is_user_profile(name, page)
+
+            if is_profile:
+                # --- USER PROFILE: Follow instead of Join ---
+                log.info("  detected user profile — using Follow")
+
+                # Check if already following
+                if _find_already_following_indicator(page):
+                    return {
+                        "status": SubscribeResult.ALREADY_FOLLOWED,
+                        "error": "",
+                        "subscribed_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                        "scraped": scraped,
+                    }
+
+                # Find the Follow button
+                follow_btn = _find_follow_button(page)
+                if follow_btn is None:
+                    # Could not find Follow button — check for deleted/suspended
+                    try:
+                        body_text = page.inner_text("body")
+                    except Exception:
+                        body_text = ""
+                    body_lower = body_text.lower()
+                    if "deleted" in body_lower or "suspended" in body_lower:
+                        return {"status": SubscribeResult.NOT_FOUND,
+                                "error": "user account deleted or suspended",
+                                "subscribed_at": "",
+                                "scraped": scraped}
+                    return {"status": SubscribeResult.FAILED,
+                            "error": f"could not find Follow button on profile. body sample: {body_text[:200]}",
+                            "subscribed_at": "",
+                            "scraped": scraped}
+
+                # --- HUMAN-LIKE BEHAVIOR (same as subreddit) ---
+                try:
+                    scroll_y = random.randint(0, 300)
+                    page.evaluate(f"window.scrollTo(0, {scroll_y})")
+                except Exception:
+                    pass
+
+                try:
+                    box = follow_btn.bounding_box()
+                    if box:
+                        if random.random() < 0.4:
+                            rand_x = random.uniform(100, 800)
+                            rand_y = random.uniform(100, 600)
+                            page.mouse.move(rand_x, rand_y, steps=random.randint(5, 15))
+
+                        target_x = box["x"] + box["width"] * random.uniform(0.2, 0.8)
+                        target_y = box["y"] + box["height"] * random.uniform(0.2, 0.8)
+                        steps = random.randint(5, 25)
+                        page.mouse.move(target_x, target_y, steps=steps)
+                        sleep_jitter(PRE_CLICK_DELAY_MIN, PRE_CLICK_DELAY_MAX, "pre-click hover")
+
+                        if random.random() < 0.15:
+                            jiggle_x = target_x + random.uniform(-3, 3)
+                            jiggle_y = target_y + random.uniform(-3, 3)
+                            page.mouse.move(jiggle_x, jiggle_y, steps=3)
+                except Exception as exc:
+                    log.debug("mouse-move failed (continuing): %s", exc)
+
+                # Click the Follow button
+                log.info("  clicking Follow ...")
+                try:
+                    follow_btn.click(timeout=10_000)
+                except Exception as exc:
+                    return {"status": SubscribeResult.FAILED,
+                            "error": f"follow click failed: {exc}",
+                            "subscribed_at": "",
+                            "scraped": scraped}
+
+                # Wait for the network to settle after the click.
+                sleep_jitter(POST_CLICK_WAIT_MIN, POST_CLICK_WAIT_MAX, "post-click settle")
+
+                # Verify: the Follow button should now say "Following".
+                try:
+                    page.wait_for_function(
+                        """
+                        () => {
+                            const btns = document.querySelectorAll(
+                                'button[aria-label*="Following" i], ' +
+                                'button[aria-label*="Follow" i]'
+                            );
+                            for (const b of btns) {
+                                const label = (b.getAttribute('aria-label') || '') + ' ' + (b.textContent || '');
+                                if (label.toLowerCase().includes('following')) return true;
+                            }
+                            return false;
+                        }
+                        """,
+                        timeout=8_000,
+                    )
+                    return {
+                        "status": SubscribeResult.FOLLOWED,
+                        "error": "",
+                        "subscribed_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                        "scraped": scraped,
+                    }
+                except Exception:
+                    if _find_already_following_indicator(page):
+                        return {
+                            "status": SubscribeResult.FOLLOWED,
+                            "error": "",
+                            "subscribed_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                            "scraped": scraped,
+                        }
+                    return {"status": SubscribeResult.FAILED,
+                            "error": "Follow button clicked but state did not change to Following",
+                            "subscribed_at": "",
+                            "scraped": scraped}
+
+            # --- SUBREDDIT: Join button (original logic) ---
             # Check if already subscribed
             if _find_already_joined_indicator(page):
                 return {
@@ -2404,8 +2652,14 @@ def run_subscribe_pass(
             consecutive_failures = 0
         elif result["status"] == SubscribeResult.ALREADY_SUBSCRIBED:
             log.info("  -> already subscribed")
-            # Count toward session cap — we still loaded the page and made
-            # an API call to Reddit's servers, so it counts against rate limits.
+            subscribe_count += 1
+            consecutive_failures = 0
+        elif result["status"] == SubscribeResult.FOLLOWED:
+            log.info("  -> followed (user profile)")
+            subscribe_count += 1
+            consecutive_failures = 0
+        elif result["status"] == SubscribeResult.ALREADY_FOLLOWED:
+            log.info("  -> already following (user profile)")
             subscribe_count += 1
             consecutive_failures = 0
         elif result["status"] in TERMINAL_STATUSES:
