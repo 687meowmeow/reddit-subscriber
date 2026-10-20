@@ -1830,7 +1830,7 @@ function RunControls({
   const handleCopyLogs = async () => {
     const text = logLines
       .map((line) =>
-        `[${new Date(line.timestamp).toLocaleTimeString(undefined, { hour12: false })}] ${line.stream === "stderr" ? "WARN" : "INFO"} ${line.text}`
+        `[${new Date(line.timestamp).toLocaleTimeString(undefined, { hour12: false })}] ${line.text}`
       )
       .join("\n");
     try {
@@ -2263,14 +2263,27 @@ function RunControls({
                   No logs yet. Click &quot;Start&quot; to begin.
                 </p>
               ) : (
-                logLines.map((line, i) => (
+                logLines.map((line, i) => {
+                  // Determine log level from the text content, not the stream.
+                  // Python's logging module sends both INFO and WARNING to stderr,
+                  // so we can't rely on the stream to determine the color.
+                  const text = line.text;
+                  const isWarning = text.includes("[WARNING]") || text.includes("[WARN]");
+                  const isError = text.includes("[ERROR]") || text.includes("[CRITICAL]");
+                  const isHealth = text.includes("[health]");
+                  const colorClass = isError
+                    ? "text-red-400"
+                    : isWarning
+                    ? "text-amber-300"
+                    : isHealth
+                    ? "text-cyan-300"
+                    : "text-slate-300";
+                  return (
                   <div
                     key={i}
                     className={cn(
                       "whitespace-pre-wrap break-all",
-                      line.stream === "stderr"
-                        ? "text-amber-300"
-                        : "text-slate-300"
+                      colorClass
                     )}
                   >
                     <span className="text-slate-600 select-none">
@@ -2278,9 +2291,10 @@ function RunControls({
                         hour12: false,
                       })}{" "}
                     </span>
-                    {line.text}
+                    {text}
                   </div>
-                ))
+                  );
+                })
               )}
               <div ref={logEndRef} />
             </div>

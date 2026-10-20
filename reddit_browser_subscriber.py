@@ -1413,8 +1413,10 @@ def _find_follow_button(page) -> Optional[object]:
     Returns the element handle, or None if not found.
 
     Reddit user profiles use 'Follow' instead of 'Join'.
-    The button is in a different component than the subreddit Join button.
+    The button is often inside a Web Component's shadow DOM, so we
+    use JavaScript to search through shadow roots as a fallback.
     """
+    # --- Method 1: Standard CSS selectors (works if button is in regular DOM) ---
     selectors = [
         # sh.reddit.com — Follow button in user profile header
         'shreddit-user-profile-header button[aria-label*="Follow" i]',
@@ -1438,6 +1440,62 @@ def _find_follow_button(page) -> Optional[object]:
                 continue
         except Exception:
             continue
+
+    # --- Method 2: JavaScript shadow DOM piercing ---
+    # The Follow button is often rendered inside a Web Component's shadow
+    # root (e.g. shreddit-user-profile-header). Playwright's :has-text()
+    # can't see into shadow DOMs, so we use JavaScript to search manually.
+    try:
+        # Find a Follow button by searching all shadow roots
+        button_info = page.evaluate(
+            """
+            () => {
+                function searchShadowRoots(root) {
+                    // Check all elements in this root
+                    const buttons = root.querySelectorAll('button');
+                    for (const btn of buttons) {
+                        const label = (btn.getAttribute('aria-label') || '') +
+                                      ' ' + (btn.textContent || '');
+                        if (label.toLowerCase().includes('follow') &&
+                            !label.toLowerCase().includes('following')) {
+                            // Add a temporary attribute so we can locate it via CSS
+                            btn.setAttribute('data-follow-btn-found', 'true');
+                            return true;
+                        }
+                    }
+                    // Recursively search shadow roots
+                    const allElements = root.querySelectorAll('*');
+                    for (const el of allElements) {
+                        if (el.shadowRoot) {
+                            if (searchShadowRoots(el.shadowRoot)) {
+                                return true;
+                            }
+                        }
+                    }
+                    return false;
+                }
+                return searchShadowRoots(document);
+            }
+            """
+        )
+        if button_info:
+            # Now locate the button we tagged
+            loc = page.locator('button[data-follow-btn-found="true"]').first
+            if loc.count() > 0:
+                try:
+                    # Remove the temporary attribute
+                    page.evaluate(
+                        """() => {
+                            const btn = document.querySelector('button[data-follow-btn-found="true"]');
+                            if (btn) btn.removeAttribute('data-follow-btn-found');
+                        }"""
+                    )
+                    return loc
+                except Exception:
+                    pass
+    except Exception as exc:
+        log.debug("shadow DOM follow button search failed: %s", exc)
+
     return None
 
 
@@ -1445,7 +1503,11 @@ def _find_already_following_indicator(page) -> bool:
     """
     Detect if the user is already following this profile.
     Called before attempting to click Follow.
+
+    Uses shadow DOM piercing to find "Following" buttons inside
+    Web Components.
     """
+    # --- Method 1: Standard CSS selectors ---
     already_indicators = [
         'button[aria-label*="Following" i]',
         'button:has-text("Following")',
@@ -1464,7 +1526,42 @@ def _find_already_following_indicator(page) -> bool:
         except Exception:
             continue
 
-    # JavaScript check — look for "following" state in page data
+    # --- Method 2: JavaScript shadow DOM piercing ---
+    try:
+        is_following = page.evaluate(
+            """
+            () => {
+                function searchShadowRoots(root) {
+                    const buttons = root.querySelectorAll('button');
+                    for (const btn of buttons) {
+                        const label = (btn.getAttribute('aria-label') || '') +
+                                      ' ' + (btn.textContent || '');
+                        const labelLower = label.toLowerCase();
+                        if (labelLower.includes('following') ||
+                            labelLower.includes('unfollow')) {
+                            return true;
+                        }
+                    }
+                    const allElements = root.querySelectorAll('*');
+                    for (const el of allElements) {
+                        if (el.shadowRoot) {
+                            if (searchShadowRoots(el.shadowRoot)) {
+                                return true;
+                            }
+                        }
+                    }
+                    return false;
+                }
+                return searchShadowRoots(document);
+            }
+            """
+        )
+        if is_following:
+            return True
+    except Exception:
+        pass
+
+    # --- Method 3: Check inline JSON scripts ---
     try:
         is_following = page.evaluate(
             """
@@ -1790,7 +1887,7 @@ def subscribe_one(session: BrowserSession, subreddit_name: str) -> Dict[str, str
                 classified = _classify_subreddit_error(url, status_code, body_text)
                 return {
                     "status": classified,
-                    "error": f"HTTP {status_code}: {body_text[:200]}",
+                    "error": f"HTTP {status_code}: {body_text[:500]}",
                     "subscribed_at": "",
                     "scraped": scraped,
                 }
@@ -1850,7 +1947,7 @@ def subscribe_one(session: BrowserSession, subreddit_name: str) -> Dict[str, str
                                 "subscribed_at": "",
                                 "scraped": scraped}
                     return {"status": SubscribeResult.FAILED,
-                            "error": f"could not find Follow button on profile. body sample: {body_text[:200]}",
+                            "error": f"could not find Follow button on profile. body sample: {body_text[:500]}",
                             "subscribed_at": "",
                             "scraped": scraped}
 
@@ -1896,19 +1993,32 @@ def subscribe_one(session: BrowserSession, subreddit_name: str) -> Dict[str, str
                 sleep_jitter(POST_CLICK_WAIT_MIN, POST_CLICK_WAIT_MAX, "post-click settle")
 
                 # Verify: the Follow button should now say "Following".
+                # Uses shadow DOM piercing to find the button inside Web Components.
                 try:
                     page.wait_for_function(
                         """
                         () => {
-                            const btns = document.querySelectorAll(
-                                'button[aria-label*="Following" i], ' +
-                                'button[aria-label*="Follow" i]'
-                            );
-                            for (const b of btns) {
-                                const label = (b.getAttribute('aria-label') || '') + ' ' + (b.textContent || '');
-                                if (label.toLowerCase().includes('following')) return true;
+                            function searchShadowRoots(root) {
+                                const buttons = root.querySelectorAll('button');
+                                for (const b of buttons) {
+                                    const label = (b.getAttribute('aria-label') || '') +
+                                                  ' ' + (b.textContent || '');
+                                    if (label.toLowerCase().includes('following') ||
+                                        label.toLowerCase().includes('unfollow')) {
+                                        return true;
+                                    }
+                                }
+                                const allElements = root.querySelectorAll('*');
+                                for (const el of allElements) {
+                                    if (el.shadowRoot) {
+                                        if (searchShadowRoots(el.shadowRoot)) {
+                                            return true;
+                                        }
+                                    }
+                                }
+                                return false;
                             }
-                            return false;
+                            return searchShadowRoots(document);
                         }
                         """,
                         timeout=8_000,
@@ -1968,7 +2078,7 @@ def subscribe_one(session: BrowserSession, subreddit_name: str) -> Dict[str, str
                             "subscribed_at": "",
                             "scraped": scraped}
                 return {"status": SubscribeResult.FAILED,
-                        "error": f"could not find Join button on page. body sample: {body_text[:200]}",
+                        "error": f"could not find Join button on page. body sample: {body_text[:500]}",
                         "subscribed_at": "",
                         "scraped": scraped}
 
