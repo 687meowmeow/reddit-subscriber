@@ -1920,10 +1920,10 @@ def subscribe_one(session: BrowserSession, subreddit_name: str) -> Dict[str, str
                                 "error": "subreddit is quarantined (HTTP error)",
                                 "subscribed_at": "",
                                 "scraped": scraped}
-                    # If we can't classify, assume banned (most 4xx on
-                    # NSFW subreddits are bans)
-                    return {"status": SubscribeResult.BANNED,
-                            "error": f"HTTP error (likely banned): {exc}",
+                    # Can't classify — mark as failed so it can be retried.
+                    # It might not be banned (could be a temporary issue).
+                    return {"status": SubscribeResult.FAILED,
+                            "error": f"HTTP error (unclassified): {exc}",
                             "subscribed_at": "",
                             "scraped": scraped}
                 if "net::ERR_NAME_NOT_RESOLVED" in err_str or "net::ERR_INTERNET_DISCONNECTED" in err_str:

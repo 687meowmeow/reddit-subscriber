@@ -9,7 +9,7 @@ import {
   CheckCircle2, XCircle, AlertCircle, Clock, Users, RefreshCw, Search,
   Loader2, FileText, Activity, Ban, Lock, ShieldAlert, Eye, EyeOff,
   ChevronDown, Filter, ExternalLink, Bug, Play, Square, Terminal, Settings,
-  Github, Upload, Copy, Check,
+  Github, Upload, Copy, Check, Download,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -1367,6 +1367,40 @@ export default function Home() {
           <div className="text-xs text-slate-500 ml-auto hidden sm:block">
             Showing {filteredRows.length} of {csvData?.totalRows ?? 0}
           </div>
+          {/* Export banned CSV */}
+          {csvData && csvData.counts?.banned > 0 && (
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => {
+                // Export only banned rows as a CSV file
+                const subCol = csvData.subCol || "subreddit";
+                const bannedRows = csvData.rows.filter(
+                  (r) => (r.status || "").trim().toLowerCase() === "banned"
+                );
+                if (bannedRows.length === 0) return;
+                // Build CSV: just the subreddit name column + status
+                const lines = [`${subCol},status`];
+                for (const row of bannedRows) {
+                  const name = (row[subCol] || "").replace(/,/g, "");
+                  lines.push(`${name},banned`);
+                }
+                const csv = lines.join("\n");
+                const blob = new Blob([csv], { type: "text/csv" });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement("a");
+                a.href = url;
+                a.download = "banned_subreddits.csv";
+                a.click();
+                URL.revokeObjectURL(url);
+              }}
+              className="gap-1.5"
+              title="Download a CSV of all banned subreddits"
+            >
+              <Download className="w-3.5 h-3.5" />
+              Export Banned ({csvData.counts.banned})
+            </Button>
+          )}
         </div>
 
         {/* Subreddit table */}
