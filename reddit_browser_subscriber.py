@@ -1447,7 +1447,7 @@ def _find_follow_button(page) -> Optional[object]:
     # can't see into shadow DOMs, so we use JavaScript to search manually.
     try:
         # Find a Follow button by searching all shadow roots
-        button_info = page.evaluate(
+        button_found = page.evaluate(
             """
             () => {
                 function searchShadowRoots(root) {
@@ -1456,10 +1456,15 @@ def _find_follow_button(page) -> Optional[object]:
                     for (const btn of buttons) {
                         const label = (btn.getAttribute('aria-label') || '') +
                                       ' ' + (btn.textContent || '');
-                        if (label.toLowerCase().includes('follow') &&
-                            !label.toLowerCase().includes('following')) {
-                            // Add a temporary attribute so we can locate it via CSS
+                        const labelLower = label.toLowerCase();
+                        // Match "Follow" but not "Following" or "Unfollow"
+                        if (labelLower.includes('follow') &&
+                            !labelLower.includes('following') &&
+                            !labelLower.includes('unfollow')) {
+                            // Add a temporary attribute so we can locate it
                             btn.setAttribute('data-follow-btn-found', 'true');
+                            // Also bring it into view
+                            btn.scrollIntoView({ block: 'center' });
                             return true;
                         }
                     }
@@ -1478,18 +1483,43 @@ def _find_follow_button(page) -> Optional[object]:
             }
             """
         )
-        if button_info:
-            # Now locate the button we tagged
+        if button_found:
+            # Try to click via JavaScript directly (works inside shadow DOMs)
+            try:
+                clicked = page.evaluate(
+                    """
+                    () => {
+                        function findAndClick(root) {
+                            const buttons = root.querySelectorAll('button[data-follow-btn-found="true"]');
+                            for (const btn of buttons) {
+                                btn.click();
+                                btn.removeAttribute('data-follow-btn-found');
+                                return true;
+                            }
+                            // Search shadow roots too
+                            const allElements = root.querySelectorAll('*');
+                            for (const el of allElements) {
+                                if (el.shadowRoot) {
+                                    if (findAndClick(el.shadowRoot)) return true;
+                                }
+                            }
+                            return false;
+                        }
+                        return findAndClick(document);
+                    }
+                    """
+                )
+                if clicked:
+                    # Return a dummy non-None value to signal success
+                    # The caller will check for None
+                    return "clicked_via_js"
+            except Exception:
+                pass
+
+            # Fallback: try Playwright locator (works if button is in main DOM)
             loc = page.locator('button[data-follow-btn-found="true"]').first
             if loc.count() > 0:
                 try:
-                    # Remove the temporary attribute
-                    page.evaluate(
-                        """() => {
-                            const btn = document.querySelector('button[data-follow-btn-found="true"]');
-                            if (btn) btn.removeAttribute('data-follow-btn-found');
-                        }"""
-                    )
                     return loc
                 except Exception:
                     pass
@@ -1862,6 +1892,45 @@ def subscribe_one(session: BrowserSession, subreddit_name: str) -> Dict[str, str
                 else:
                     response = page.goto(url, wait_until="domcontentloaded", timeout=45_000)
             except Exception as exc:
+                # --- NAVIGATION ERROR HANDLING ---
+                # ERR_HTTP_RESPONSE_CODE_FAILURE means Reddit returned an error
+                # status (403, 404, 451, etc.). These are almost always banned
+                # or quarantined subreddits. Classify them instead of marking
+                # as 'failed' so they don't get retried.
+                err_str = str(exc).lower()
+                if "err_http_response_code_failure" in err_str:
+                    # Try to get the body text to classify the error
+                    try:
+                        body_text = page.inner_text("body")
+                    except Exception:
+                        body_text = ""
+                    body_lower = body_text.lower()
+                    if "banned" in body_lower:
+                        return {"status": SubscribeResult.BANNED,
+                                "error": "subreddit banned (HTTP error)",
+                                "subscribed_at": "",
+                                "scraped": scraped}
+                    if "private" in body_lower or "invite-only" in body_lower:
+                        return {"status": SubscribeResult.PRIVATE,
+                                "error": "subreddit is private (HTTP error)",
+                                "subscribed_at": "",
+                                "scraped": scraped}
+                    if "quarantined" in body_lower:
+                        return {"status": SubscribeResult.QUARANTINED,
+                                "error": "subreddit is quarantined (HTTP error)",
+                                "subscribed_at": "",
+                                "scraped": scraped}
+                    # If we can't classify, assume banned (most 4xx on
+                    # NSFW subreddits are bans)
+                    return {"status": SubscribeResult.BANNED,
+                            "error": f"HTTP error (likely banned): {exc}",
+                            "subscribed_at": "",
+                            "scraped": scraped}
+                if "net::ERR_NAME_NOT_RESOLVED" in err_str or "net::ERR_INTERNET_DISCONNECTED" in err_str:
+                    return {"status": SubscribeResult.FAILED,
+                            "error": f"network error (will retry): {exc}",
+                            "subscribed_at": "",
+                            "scraped": scraped}
                 return {"status": SubscribeResult.FAILED,
                         "error": f"navigation error: {exc}",
                         "subscribed_at": "",
@@ -1935,12 +2004,17 @@ def subscribe_one(session: BrowserSession, subreddit_name: str) -> Dict[str, str
                 # Find the Follow button
                 follow_btn = _find_follow_button(page)
                 if follow_btn is None:
-                    # Could not find Follow button — check for deleted/suspended
+                    # Could not find Follow button — check why
                     try:
                         body_text = page.inner_text("body")
                     except Exception:
                         body_text = ""
                     body_lower = body_text.lower()
+                    if "this account has been banned" in body_lower or "account has been banned" in body_lower:
+                        return {"status": SubscribeResult.BANNED,
+                                "error": "user account banned",
+                                "subscribed_at": "",
+                                "scraped": scraped}
                     if "deleted" in body_lower or "suspended" in body_lower:
                         return {"status": SubscribeResult.NOT_FOUND,
                                 "error": "user account deleted or suspended",
@@ -1952,42 +2026,49 @@ def subscribe_one(session: BrowserSession, subreddit_name: str) -> Dict[str, str
                             "scraped": scraped}
 
                 # --- HUMAN-LIKE BEHAVIOR (same as subreddit) ---
-                try:
-                    scroll_y = random.randint(0, 300)
-                    page.evaluate(f"window.scrollTo(0, {scroll_y})")
-                except Exception:
-                    pass
+                # Only do mouse movement if we have a real Playwright locator
+                # (not the "clicked_via_js" string)
+                if follow_btn != "clicked_via_js":
+                    try:
+                        scroll_y = random.randint(0, 300)
+                        page.evaluate(f"window.scrollTo(0, {scroll_y})")
+                    except Exception:
+                        pass
 
-                try:
-                    box = follow_btn.bounding_box()
-                    if box:
-                        if random.random() < 0.4:
-                            rand_x = random.uniform(100, 800)
-                            rand_y = random.uniform(100, 600)
-                            page.mouse.move(rand_x, rand_y, steps=random.randint(5, 15))
+                    try:
+                        box = follow_btn.bounding_box()
+                        if box:
+                            if random.random() < 0.4:
+                                rand_x = random.uniform(100, 800)
+                                rand_y = random.uniform(100, 600)
+                                page.mouse.move(rand_x, rand_y, steps=random.randint(5, 15))
 
-                        target_x = box["x"] + box["width"] * random.uniform(0.2, 0.8)
-                        target_y = box["y"] + box["height"] * random.uniform(0.2, 0.8)
-                        steps = random.randint(5, 25)
-                        page.mouse.move(target_x, target_y, steps=steps)
-                        sleep_jitter(PRE_CLICK_DELAY_MIN, PRE_CLICK_DELAY_MAX, "pre-click hover")
+                            target_x = box["x"] + box["width"] * random.uniform(0.2, 0.8)
+                            target_y = box["y"] + box["height"] * random.uniform(0.2, 0.8)
+                            steps = random.randint(5, 25)
+                            page.mouse.move(target_x, target_y, steps=steps)
+                            sleep_jitter(PRE_CLICK_DELAY_MIN, PRE_CLICK_DELAY_MAX, "pre-click hover")
 
-                        if random.random() < 0.15:
-                            jiggle_x = target_x + random.uniform(-3, 3)
-                            jiggle_y = target_y + random.uniform(-3, 3)
-                            page.mouse.move(jiggle_x, jiggle_y, steps=3)
-                except Exception as exc:
-                    log.debug("mouse-move failed (continuing): %s", exc)
+                            if random.random() < 0.15:
+                                jiggle_x = target_x + random.uniform(-3, 3)
+                                jiggle_y = target_y + random.uniform(-3, 3)
+                                page.mouse.move(jiggle_x, jiggle_y, steps=3)
+                    except Exception as exc:
+                        log.debug("mouse-move failed (continuing): %s", exc)
 
-                # Click the Follow button
-                log.info("  clicking Follow ...")
-                try:
-                    follow_btn.click(timeout=10_000)
-                except Exception as exc:
-                    return {"status": SubscribeResult.FAILED,
-                            "error": f"follow click failed: {exc}",
-                            "subscribed_at": "",
-                            "scraped": scraped}
+                    # Click the Follow button via Playwright
+                    log.info("  clicking Follow ...")
+                    try:
+                        follow_btn.click(timeout=10_000)
+                    except Exception as exc:
+                        return {"status": SubscribeResult.FAILED,
+                                "error": f"follow click failed: {exc}",
+                                "subscribed_at": "",
+                                "scraped": scraped}
+                else:
+                    # Button was already clicked via JavaScript (shadow DOM)
+                    log.info("  Follow button clicked via JavaScript (shadow DOM)")
+                    sleep_jitter(PRE_CLICK_DELAY_MIN, PRE_CLICK_DELAY_MAX, "pre-click delay")
 
                 # Wait for the network to settle after the click.
                 sleep_jitter(POST_CLICK_WAIT_MIN, POST_CLICK_WAIT_MAX, "post-click settle")
