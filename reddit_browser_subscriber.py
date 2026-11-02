@@ -2608,7 +2608,7 @@ def run_subscribe_pass(
     pending_start = sum(1 for r in rows
                         if (r.get(STATUS_COL) or "pending") not in DONE_STATUSES
                         and (r.get(STATUS_COL) or "pending") not in TERMINAL_STATUSES)
-    log.info("Rows pending subscription: %d", pending_start)
+    log.info("Rows to process (pending + failed + shadowbanned + aborted): %d", pending_start)
 
     subscribe_count = 0
     consecutive_failures = 0

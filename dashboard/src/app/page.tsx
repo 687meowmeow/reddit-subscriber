@@ -224,6 +224,12 @@ export default function Home() {
   const [search, setSearch] = useState<string>("");
   const [statusFilter, setStatusFilter] = useState<string>("all");
   const [nsfwFilter, setNsfwFilter] = useState<"all" | "sfw" | "nsfw">("all");
+  // Limit visible rows for performance — rendering 4035 rows at once
+  // makes the page extremely laggy. Show 100, load more on demand.
+  const [visibleCount, setVisibleCount] = useState<number>(100);
+  // Debounced search — don't filter on every keystroke
+  const [debouncedSearch, setDebouncedSearch] = useState<string>("");
+  const searchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Settings state
   const [showSettings, setShowSettings] = useState<boolean>(false);
@@ -529,14 +535,31 @@ export default function Home() {
     return { total, done, failed, pending, terminal };
   }, [csvData]);
 
+  // Debounce search input — wait 300ms after the user stops typing
+  // before filtering. This prevents re-filtering 4035 rows on every
+  // keystroke, which causes massive lag.
+  const handleSearchChange = useCallback((value: string) => {
+    setSearch(value);
+    if (searchTimerRef.current) clearTimeout(searchTimerRef.current);
+    searchTimerRef.current = setTimeout(() => {
+      setDebouncedSearch(value);
+      setVisibleCount(100); // reset pagination on new search
+    }, 300);
+  }, []);
+
+  // Reset visible count when filters change
+  useEffect(() => {
+    setVisibleCount(100);
+  }, [statusFilter, nsfwFilter]);
+
   // Filtered rows for the table
   const filteredRows = useMemo(() => {
     if (!csvData) return [];
     return csvData.rows.filter((row) => {
       const subCol = csvData.subCol || "subreddit";
       const name = (row[subCol] || "").toLowerCase();
-      // search
-      if (search && !name.includes(search.toLowerCase())) return false;
+      // search (uses debounced value)
+      if (debouncedSearch && !name.includes(debouncedSearch.toLowerCase())) return false;
       // status filter
       if (statusFilter !== "all") {
         const status = (row.status || "pending").trim().toLowerCase() || "pending";
@@ -554,7 +577,12 @@ export default function Home() {
       }
       return true;
     });
-  }, [csvData, search, statusFilter, nsfwFilter]);
+  }, [csvData, debouncedSearch, statusFilter, nsfwFilter]);
+
+  // Only render the first `visibleCount` rows — this is the key to
+  // eliminating UI lag. Rendering 4035 <tr> elements every refresh
+  // was the bottleneck. Now we only render 100 at a time.
+  const visibleRows = useMemo(() => filteredRows.slice(0, visibleCount), [filteredRows, visibleCount]);
 
   return (
     <div className="min-h-screen flex flex-col bg-gradient-to-br from-slate-50 via-white to-slate-100 dark:from-slate-950 dark:via-slate-900 dark:to-slate-950">
@@ -1337,7 +1365,7 @@ export default function Home() {
             <Input
               placeholder="Search subreddits..."
               value={search}
-              onChange={(e) => setSearch(e.target.value)}
+              onChange={(e) => handleSearchChange(e.target.value)}
               className="pl-10"
             />
           </div>
@@ -1365,7 +1393,7 @@ export default function Home() {
             </SelectContent>
           </Select>
           <div className="text-xs text-slate-500 ml-auto hidden sm:block">
-            Showing {filteredRows.length} of {csvData?.totalRows ?? 0}
+            Showing {visibleRows.length} of {filteredRows.length}
           </div>
           {/* Export banned CSV */}
           {csvData && csvData.counts?.banned > 0 && (
@@ -1406,7 +1434,15 @@ export default function Home() {
         {/* Subreddit table */}
         <Card className="flex-1 flex flex-col min-h-[400px]">
           <CardHeader className="border-b border-slate-200 dark:border-slate-800 py-3">
-            <CardTitle className="text-base">Subreddits</CardTitle>
+            <CardTitle className="text-base flex items-center justify-between">
+              <span>Subreddits</span>
+              <span className="text-xs text-slate-500 font-normal">
+                Showing {visibleRows.length} of {filteredRows.length}
+                {filteredRows.length !== (csvData?.totalRows ?? 0) && (
+                  <span className="ml-1">(filtered from {csvData?.totalRows ?? 0})</span>
+                )}
+              </span>
+            </CardTitle>
           </CardHeader>
           <CardContent className="p-0 flex-1 flex flex-col overflow-hidden">
             {/* Native scroll container — works on all devices (touch + mouse) */}
@@ -1446,7 +1482,7 @@ export default function Home() {
                           </td>
                         </tr>
                       ) : (
-                        filteredRows.map((row, idx) => {
+                        visibleRows.map((row, idx) => {
                           const subCol = csvData?.subCol || "subreddit";
                           const name = row[subCol] || "";
                           const status = (row.status || "pending").trim() || "pending";
@@ -1589,6 +1625,19 @@ export default function Home() {
                   </tbody>
                 </table>
               </div>
+              {/* Load more button — only show if there are more rows */}
+              {visibleCount < filteredRows.length && (
+                <div className="p-3 border-t border-slate-200 dark:border-slate-800 text-center">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => setVisibleCount((c) => c + 100)}
+                    className="w-full"
+                  >
+                    Load more ({filteredRows.length - visibleCount} remaining)
+                  </Button>
+                </div>
+              )}
             </div>
           </CardContent>
         </Card>
