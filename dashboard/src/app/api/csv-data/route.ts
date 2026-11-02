@@ -164,7 +164,9 @@ export async function GET(request: NextRequest) {
 
     const counts: Record<string, number> = {};
     for (const row of rows) {
-      const status = (row.status || "pending").trim() || "pending";
+      // Normalize status: trim + lowercase for consistent counting.
+      // Without lowercase, "Pending" and "pending" are counted separately.
+      const status = ((row.status || "pending").trim() || "pending").toLowerCase();
       counts[status] = (counts[status] || 0) + 1;
     }
 

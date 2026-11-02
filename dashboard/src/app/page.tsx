@@ -84,6 +84,20 @@ const STATUS_CONFIG: Record<string, StatusInfo> = {
     border: "border-sky-200 dark:border-sky-800",
     icon: CheckCircle2, description: "Was already subscribed before this run",
   },
+  followed: {
+    label: "Followed", category: "done",
+    color: "text-emerald-700 dark:text-emerald-300",
+    bg: "bg-emerald-50 dark:bg-emerald-950/40",
+    border: "border-emerald-200 dark:border-emerald-800",
+    icon: CheckCircle2, description: "Successfully followed this user profile",
+  },
+  already_followed: {
+    label: "Already Following", category: "done",
+    color: "text-sky-700 dark:text-sky-300",
+    bg: "bg-sky-50 dark:bg-sky-950/40",
+    border: "border-sky-200 dark:border-sky-800",
+    icon: CheckCircle2, description: "Was already following this user profile",
+  },
   failed: {
     label: "Failed", category: "retryable",
     color: "text-amber-700 dark:text-amber-300",
@@ -526,7 +540,8 @@ export default function Home() {
     }
     const counts = csvData.counts || {};
     const total = csvData.totalRows;
-    const done = (counts.subscribed || 0) + (counts.already_subscribed || 0);
+    const done = (counts.subscribed || 0) + (counts.already_subscribed || 0) +
+                 (counts.followed || 0) + (counts.already_followed || 0);
     const failed = (counts.failed || 0) + (counts.shadowbanned || 0) + (counts.aborted || 0);
     const pending = counts.pending || 0;
     const terminal =
