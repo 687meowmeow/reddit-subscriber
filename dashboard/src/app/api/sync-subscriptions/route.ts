@@ -3,6 +3,7 @@ import { promises as fs } from "fs";
 import { spawn } from "child_process";
 import path from "path";
 import fsSync from "fs";
+import logger from "@/lib/logger";
 
 // ============================================================
 // Sync subscriptions — fetch the user's LIVE subscribed subreddit
@@ -221,11 +222,16 @@ except Exception as e:
 `;
 
 export async function POST(request: NextRequest) {
+  const routeName = "POST /api/sync-subscriptions";
+  const startTime = Date.now();
   try {
     const body = await request.json().catch(() => ({}));
     const csvParam = body.csv;
 
+    logger.info("Sync subscriptions request received", { csv: csvParam }, routeName);
+
     if (!csvParam) {
+      logger.warn("Sync rejected — missing csv field", undefined, routeName);
       return NextResponse.json(
         { error: "Missing 'csv' field" },
         { status: 400 }
@@ -315,6 +321,10 @@ export async function POST(request: NextRequest) {
     try { await fs.unlink(scriptPath); } catch {}
 
     if (!result.ok) {
+      logger.warn("Sync — Python helper returned error", {
+        error: result.error,
+        duration_ms: Date.now() - startTime,
+      }, routeName);
       return NextResponse.json(
         { error: result.error || "Failed to fetch subscriptions" },
         { status: 500 }
@@ -322,6 +332,11 @@ export async function POST(request: NextRequest) {
     }
 
     const liveSubs: Array<{ name: string; is_nsfw: boolean }> = result.subreddits || [];
+
+    logger.info("Sync — fetched live subscriptions", {
+      total_live: liveSubs.length,
+      duration_ms: Date.now() - startTime,
+    }, routeName);
 
     if (liveSubs.length === 0) {
       return NextResponse.json({
@@ -360,6 +375,9 @@ export async function POST(request: NextRequest) {
     const missing = liveSubs.filter((s) => !existingNames.has(s.name.toLowerCase()));
 
     if (missing.length === 0) {
+      logger.info("Sync — all subs already in CSV, nothing to add", {
+        total_live: liveSubs.length,
+      }, routeName);
       return NextResponse.json({
         ok: true,
         message: `All ${liveSubs.length} subscribed subreddits are already in the CSV`,
@@ -395,6 +413,13 @@ export async function POST(request: NextRequest) {
     const newText = text.endsWith("\n") ? text + newLines.join("\n") + "\n" : text + "\n" + newLines.join("\n") + "\n";
     await fs.writeFile(resolvedPath, newText, "utf-8");
 
+    logger.info("Sync complete — appended missing subreddits to CSV", {
+      added: missing.length,
+      total_live: liveSubs.length,
+      added_names: missing.slice(0, 10).map((s) => s.name),
+      duration_ms: Date.now() - startTime,
+    }, routeName);
+
     return NextResponse.json({
       ok: true,
       message: `Added ${missing.length} subreddit(s) to the CSV`,
@@ -405,6 +430,10 @@ export async function POST(request: NextRequest) {
     });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
+    logger.error("Sync subscriptions failed", {
+      error: message,
+      duration_ms: Date.now() - startTime,
+    }, routeName, err instanceof Error ? err.stack : undefined);
     return NextResponse.json(
       { error: `Sync failed: ${message}` },
       { status: 500 }

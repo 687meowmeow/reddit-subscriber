@@ -4,6 +4,7 @@ import path from "path";
 import fsSync from "fs";
 import { exec } from "child_process";
 import { promisify } from "util";
+import logger from "@/lib/logger";
 
 const execAsync = promisify(exec);
 
@@ -154,10 +155,19 @@ async function installPythonDeps(cwd: string, pythonCmd: string): Promise<boolea
 }
 
 export async function GET() {
+  const routeName = "GET /api/auto-update";
+  const start = Date.now();
   const config = await readConfig();
   const cwd = config.csvRoot || path.resolve(process.cwd(), "..");
 
+  logger.info("Auto-update check started", {
+    cwd,
+    autoUpdate: config.autoUpdate,
+    hasGithubRepo: !!config.githubRepo,
+  }, routeName);
+
   if (!isGitRepo(cwd)) {
+    logger.warn("Auto-update skipped — not a git repo", { cwd }, routeName);
     return NextResponse.json({
       enabled: false,
       isGitRepo: false,
@@ -173,6 +183,10 @@ export async function GET() {
   const enabled = Boolean(config.autoUpdate && config.githubRepo);
 
   if (!enabled) {
+    logger.info("Auto-update disabled — skipping fetch", {
+      branch,
+      currentCommit: currentCommit?.slice(0, 8),
+    }, routeName);
     return NextResponse.json({
       enabled: false,
       isGitRepo: true,
@@ -194,6 +208,10 @@ export async function GET() {
     const remoteHead = await getRemoteHead(cwd, branch);
 
     if (!remoteHead) {
+      logger.warn("Auto-update — fetch from remote failed", {
+        branch,
+        cwd,
+      }, routeName);
       return NextResponse.json({
         enabled: true,
         isGitRepo: true,
@@ -205,6 +223,10 @@ export async function GET() {
     }
 
     if (currentCommit === remoteHead) {
+      logger.info("Auto-update — already up to date", {
+        branch,
+        commit: currentCommit?.slice(0, 8),
+      }, routeName);
       return NextResponse.json({
         enabled: true,
         isGitRepo: true,
@@ -215,6 +237,12 @@ export async function GET() {
         lastChecked: new Date().toISOString(),
       });
     }
+
+    logger.info("Auto-update — new commits detected", {
+      branch,
+      old_commit: currentCommit?.slice(0, 8),
+      new_commit: remoteHead.slice(0, 8),
+    }, routeName);
 
     const oldCommit = currentCommit;
     const newCommit = remoteHead;
@@ -228,6 +256,9 @@ export async function GET() {
     const pauseFlagPath = path.join(cwd, ".update-pause-flag");
     try {
       await fs.writeFile(pauseFlagPath, "paused", "utf-8");
+      logger.info("Auto-update — pause flag set, waiting 3s for subscriber to notice", {
+        pauseFlagPath,
+      }, routeName);
       // Give the subscriber a moment to notice the flag and finish any
       // in-progress page load before we start modifying files.
       await new Promise((resolve) => setTimeout(resolve, 3000));
@@ -242,12 +273,22 @@ export async function GET() {
     // We already fetched above (in getRemoteHead), so origin/<branch>
     // is up to date. Just reset to it.
     try {
+      logger.info("Auto-update — running git reset --hard", {
+        target: `origin/${branch}`,
+        cwd,
+      }, routeName);
       await git(["reset", "--hard", `origin/${branch}`], cwd, {
         GIT_TERMINAL_PROMPT: "0",
       });
+      logger.info("Auto-update — git reset --hard completed", {
+        duration_ms: Date.now() - start,
+      }, routeName);
     } catch (err: any) {
       // Remove the pause flag even on error so the subscriber can continue
       try { await fs.unlink(pauseFlagPath); } catch {}
+      logger.error("Auto-update — git reset --hard failed", {
+        error: err.message,
+      }, routeName, err.stack);
       return NextResponse.json({
         enabled: true,
         isGitRepo: true,
@@ -269,7 +310,10 @@ export async function GET() {
 
     // --- REMOVE PAUSE FLAG ---
     // The update is done — let the subscriber resume processing.
-    try { await fs.unlink(pauseFlagPath); } catch {}
+    try {
+      await fs.unlink(pauseFlagPath);
+      logger.info("Auto-update — pause flag removed, subscriber can resume", {}, routeName);
+    } catch {}
 
     const pythonScriptChanged = changedFiles.includes("reddit_browser_subscriber.py");
     const nextConfigChanged = changedFiles.some(
@@ -278,6 +322,14 @@ export async function GET() {
     const dashboardCodeChanged = changedFiles.some(
       (f) => f.startsWith("dashboard/src/") || f.startsWith("dashboard/public/")
     );
+
+    logger.info("Auto-update complete", {
+      commits_pulled: commitLog.length,
+      files_changed: changedFiles.length,
+      python_script_changed: changedFiles.includes("reddit_browser_subscriber.py"),
+      dashboard_code_changed: changedFiles.some(f => f.startsWith("dashboard/src/")),
+      duration_ms: Date.now() - start,
+    }, routeName);
 
     return NextResponse.json({
       enabled: true,

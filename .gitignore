@@ -31,3 +31,8 @@ dashboard/.config.json
 
 # Pause flag file (created by auto-update during updates)
 .update-pause-flag
+
+# Server logs (created by the dashboard's logger — never check in)
+.dashboard.log
+.dashboard.log.1
+*.fetch_subs_temp.py

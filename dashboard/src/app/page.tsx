@@ -8,7 +8,7 @@ import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import {
   CheckCircle2, XCircle, AlertCircle, Clock, Users, RefreshCw, Search,
   Loader2, FileText, Activity, Ban, Lock, ShieldAlert, Eye, EyeOff,
-  ChevronDown, Filter, ExternalLink, Bug, Play, Square, Terminal, Settings,
+  ChevronDown, Filter, ExternalLink, Play, Square, Terminal, Settings,
   Github, Upload, Copy, Check, Download, Pencil, MoreVertical, Menu as MenuIcon,
 } from "lucide-react";
 import { useRouter } from "next/navigation";
@@ -283,11 +283,13 @@ export default function Home() {
   const [uploadResult, setUploadResult] = useState<any>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  // Debug panel state
-  const [showDebug, setShowDebug] = useState<boolean>(false);
-  const [debugInfo, setDebugInfo] = useState<any>(null);
-  const [debugLoading, setDebugLoading] = useState<boolean>(false);
-  const [csvListDebug, setCsvListDebug] = useState<any>(null);
+  // NOTE: the old Debug panel (Bug icon, environment diagnostics, CSV
+  // list debug) has been REMOVED. It was a static snapshot of one
+  // moment in time — useless for actually finding issues. It's been
+  // replaced by the /logs page, which shows a live tail of EVERY
+  // server-side action, request, response, and error. Click the
+  // Terminal icon in the header (or use the "View Server Logs" item
+  // in the mobile menu) to open it.
 
   // Fetch the list of CSV files
   const fetchCsvList = useCallback(async () => {
@@ -295,10 +297,6 @@ export default function Home() {
     try {
       const res = await fetch("/api/csv-list");
       const data = await res.json();
-      // Always capture debug info if present
-      if (data.debug) {
-        setCsvListDebug(data.debug);
-      }
       if (!res.ok) {
         setListError(data.error || `HTTP ${res.status}`);
         setCsvFiles([]);
@@ -354,19 +352,10 @@ export default function Home() {
     }
   }, []);
 
-  // Fetch debug info from /api/debug
-  const fetchDebugInfo = useCallback(async () => {
-    setDebugLoading(true);
-    try {
-      const res = await fetch("/api/debug");
-      const data = await res.json();
-      setDebugInfo(data);
-    } catch (err) {
-      setDebugInfo({ error: err instanceof Error ? err.message : String(err) });
-    } finally {
-      setDebugLoading(false);
-    }
-  }, []);
+  // NOTE: fetchDebugInfo was removed when the Debug panel was replaced
+  // by the /logs page. The /api/debug endpoint still exists for
+  // backwards compat (and is itself logged now), but the dashboard
+  // no longer calls it.
 
   // Fetch settings from /api/settings
   const fetchSettings = useCallback(async () => {
@@ -892,21 +881,17 @@ export default function Home() {
                     Find Similar Subreddits
                   </Button>
 
-                  {/* Debug */}
+                  {/* View Logs — navigates to the standalone /logs page */}
                   <Button
                     variant="outline"
-                    className={cn(
-                      "w-full justify-start gap-2",
-                      showDebug && "bg-orange-100 dark:bg-orange-900/30 border-orange-300 dark:border-orange-700"
-                    )}
+                    className="w-full justify-start gap-2"
                     onClick={() => {
-                      setShowDebug(!showDebug);
-                      if (!showDebug) fetchDebugInfo();
                       setMobileMenuOpen(false);
+                      router.push("/logs");
                     }}
                   >
-                    <Bug className="w-4 h-4" />
-                    {showDebug ? "Hide Debug" : "Show Debug"}
+                    <Terminal className="w-4 h-4" />
+                    View Server Logs
                   </Button>
 
                   <SheetClose asChild>
@@ -983,14 +968,11 @@ export default function Home() {
             <Button
               variant="outline"
               size="icon"
-              onClick={() => {
-                setShowDebug(!showDebug);
-                if (!showDebug) fetchDebugInfo();
-              }}
-              title="Toggle debug panel"
-              className={cn("hidden sm:flex", showDebug && "bg-orange-100 dark:bg-orange-900/30 border-orange-300 dark:border-orange-700")}
+              onClick={() => router.push("/logs")}
+              title="View server logs (every action, request, and error)"
+              className="hidden sm:flex"
             >
-              <Bug className="w-4 h-4" />
+              <Terminal className="w-4 h-4" />
             </Button>
           </div>
         </div>
@@ -1273,182 +1255,6 @@ export default function Home() {
           </Card>
         )}
 
-        {/* Debug panel */}
-        {showDebug && (
-          <Card className="border-orange-200 dark:border-orange-800 bg-orange-50/50 dark:bg-orange-950/20">
-            <CardHeader>
-              <CardTitle className="text-base flex items-center gap-2">
-                <Bug className="w-4 h-4" />
-                Debug Diagnostics
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  onClick={fetchDebugInfo}
-                  disabled={debugLoading}
-                  className="ml-auto"
-                >
-                  {debugLoading ? <Loader2 className="w-3 h-3 animate-spin" /> : <RefreshCw className="w-3 h-3" />}
-                  Refresh
-                </Button>
-              </CardTitle>
-            </CardHeader>
-            <CardContent className="space-y-3">
-              {debugInfo && (
-                <div className="space-y-2 text-xs font-mono">
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
-                    <div className="p-2 rounded bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800">
-                      <p className="font-bold text-slate-700 dark:text-slate-300">Environment</p>
-                      <p>Platform: {debugInfo.platform}</p>
-                      <p>Node: {debugInfo.nodeVersion}</p>
-                      <p>cwd: {debugInfo.cwd}</p>
-                    </div>
-                    <div className="p-2 rounded bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800">
-                      <p className="font-bold text-slate-700 dark:text-slate-300">Path Resolution</p>
-                      <p>Final root: {debugInfo.pathResolution?.finalRoot}</p>
-                      <p>Sandbox fallback exists: {String(debugInfo.pathResolution?.sandboxFallbackExists)}</p>
-                    </div>
-                  </div>
-
-                  {debugInfo.pathResolution?.steps && (
-                    <div className="p-2 rounded bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800">
-                      <p className="font-bold text-slate-700 dark:text-slate-300">Path walk steps</p>
-                      {debugInfo.pathResolution.steps.map((step: string, i: number) => (
-                        <p key={i} className="text-slate-600 dark:text-slate-400">{step}</p>
-                      ))}
-                    </div>
-                  )}
-
-                  {debugInfo.directoryListing && (
-                    <div className="p-2 rounded bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800">
-                      <p className="font-bold text-slate-700 dark:text-slate-300">
-                        Directory listing ({debugInfo.directoryListing.root})
-                      </p>
-                      {debugInfo.directoryListing.csvFiles.length > 0 ? (
-                        <>
-                          <p className="text-emerald-600 dark:text-emerald-400 font-bold">
-                            Found {debugInfo.directoryListing.csvFiles.length} CSV files:
-                          </p>
-                          {debugInfo.directoryListing.csvFiles.map((f: string, i: number) => (
-                            <p key={i} className="text-emerald-700 dark:text-emerald-300">  {f}</p>
-                          ))}
-                        </>
-                      ) : (
-                        <p className="text-red-600 dark:text-red-400 font-bold">
-                          No CSV files found in this directory!
-                        </p>
-                      )}
-                      <p className="mt-2 text-slate-500">All entries ({debugInfo.directoryListing.entries.length}):</p>
-                      {debugInfo.directoryListing.entries.map((e: string, i: number) => (
-                        <p key={i} className="text-slate-600 dark:text-slate-400">{e}</p>
-                      ))}
-                    </div>
-                  )}
-
-                  {debugInfo.sampleCsvCheck && (
-                    <div className="p-2 rounded bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800">
-                      <p className="font-bold text-slate-700 dark:text-slate-300">Sample CSV check</p>
-                      <p>Path: {debugInfo.sampleCsvCheck.path}</p>
-                      <p>Exists: {String(debugInfo.sampleCsvCheck.exists)}</p>
-                      {debugInfo.sampleCsvCheck.size !== undefined && (
-                        <p>Size: {debugInfo.sampleCsvCheck.size} bytes</p>
-                      )}
-                      {debugInfo.sampleCsvCheck.firstFewLines && (
-                        <>
-                          <p className="mt-1">First 5 lines:</p>
-                          {debugInfo.sampleCsvCheck.firstFewLines.map((line: string, i: number) => (
-                            <p key={i} className="text-slate-600 dark:text-slate-400">{line}</p>
-                          ))}
-                        </>
-                      )}
-                    </div>
-                  )}
-
-                  {debugInfo.errors && debugInfo.errors.length > 0 && (
-                    <div className="p-2 rounded bg-red-50 dark:bg-red-950/30 border border-red-200 dark:border-red-800">
-                      <p className="font-bold text-red-700 dark:text-red-300">Errors</p>
-                      {debugInfo.errors.map((e: string, i: number) => (
-                        <p key={i} className="text-red-600 dark:text-red-400">{e}</p>
-                      ))}
-                    </div>
-                  )}
-
-                  {csvListDebug && (
-                    <div className="p-2 rounded bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800">
-                      <p className="font-bold text-slate-700 dark:text-slate-300">CSV list API debug</p>
-                      <p>cwd: {csvListDebug.cwd}</p>
-                      <p>projectRoot: {csvListDebug.projectRoot}</p>
-                      <p>allowedRoot: {csvListDebug.allowedRoot}</p>
-                      <p>csvCount: {csvListDebug.csvCount}</p>
-                      <p>entries: {csvListDebug.entries?.join(", ")}</p>
-                    </div>
-                  )}
-                </div>
-              )}
-            </CardContent>
-          </Card>
-        )}
-
-        {/* Upload result display */}
-        {uploadResult && (
-          <Card className={
-            uploadResult.error
-              ? "border-red-200 dark:border-red-800 bg-red-50 dark:bg-red-950/30"
-              : "border-emerald-200 dark:border-emerald-800 bg-emerald-50 dark:bg-emerald-950/30"
-          }>
-            <CardContent className="pt-6">
-              <div className="flex items-start gap-3">
-                {uploadResult.error ? (
-                  <XCircle className="w-5 h-5 flex-shrink-0 text-red-600 dark:text-red-400" />
-                ) : (
-                  <CheckCircle2 className="w-5 h-5 flex-shrink-0 text-emerald-600 dark:text-emerald-400" />
-                )}
-                <div className="flex-1">
-                  <p className="font-semibold">
-                    {uploadResult.error ? "Upload Failed" : "CSV Imported"}
-                  </p>
-                  {uploadResult.error ? (
-                    <p className="text-sm text-red-600 dark:text-red-400">{uploadResult.error}</p>
-                  ) : (
-                    <div className="text-sm text-emerald-700 dark:text-emerald-300 space-y-1">
-                      <p>{uploadResult.message}</p>
-                      <p className="text-xs">
-                        <strong>{uploadResult.filename}</strong> · {uploadResult.rows} rows · {(uploadResult.size / 1024).toFixed(1)} KB
-                      </p>
-                      {uploadResult.isStatusFile && (
-                        <p className="text-xs text-emerald-600 dark:text-emerald-400">
-                          Status file detected — existing subscription progress will be preserved.
-                        </p>
-                      )}
-                      {uploadResult.hasStatusColumn && uploadResult.statusCounts && Object.keys(uploadResult.statusCounts).length > 0 && (
-                        <div className="text-xs mt-1">
-                          <span className="text-slate-600 dark:text-slate-400">Status counts:</span>{" "}
-                          {Object.entries(uploadResult.statusCounts).map(([status, count]) => (
-                            <Badge key={status} variant="outline" className="ml-1 py-0 px-1.5 text-[10px]">
-                              {status}: {count as number}
-                            </Badge>
-                          ))}
-                        </div>
-                      )}
-                      {uploadResult.overwritten && (
-                        <p className="text-xs text-amber-600 dark:text-amber-400 mt-1">
-                          Note: a file with this name already existed and was overwritten.
-                        </p>
-                      )}
-                    </div>
-                  )}
-                </div>
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  onClick={() => setUploadResult(null)}
-                  className="text-slate-500"
-                >
-                  Dismiss
-                </Button>
-              </div>
-            </CardContent>
-          </Card>
-        )}
 
         {/* List error display */}
         {listError && (

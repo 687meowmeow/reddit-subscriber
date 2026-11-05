@@ -4,6 +4,7 @@ import { promises as fs } from "fs";
 import path from "path";
 import os from "os";
 import { execSync } from "child_process";
+import logger from "@/lib/logger";
 
 // ============================================================
 // Debug endpoint — useful for diagnosing remote-access issues.
@@ -11,6 +12,11 @@ import { execSync } from "child_process";
 // ============================================================
 
 export async function GET(request: NextRequest) {
+  const routeName = "GET /api/debug";
+  logger.info("Debug endpoint called", {
+    host: request.headers.get("host"),
+    origin: request.headers.get("origin"),
+  }, routeName);
   const debug: Record<string, any> = {
     timestamp: new Date().toISOString(),
   };

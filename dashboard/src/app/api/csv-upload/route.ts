@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { promises as fs } from "fs";
 import path from "path";
 import fsSync from "fs";
+import logger from "@/lib/logger";
 
 // ============================================================
 // CSV Upload endpoint — accepts a CSV file via multipart/form-data
@@ -41,11 +42,15 @@ async function getCsvRoot(): Promise<string> {
 }
 
 export async function POST(request: NextRequest) {
+  const start = Date.now();
+  const routeName = "POST /api/csv-upload";
   try {
     const csvRoot = await getCsvRoot();
+    logger.info("CSV upload request received", { csvRoot }, routeName);
 
     // Verify csvRoot exists
     if (!fsSync.existsSync(csvRoot)) {
+      logger.error("CSV upload failed — csvRoot does not exist", { csvRoot }, routeName);
       return NextResponse.json(
         { error: `CSV root directory does not exist: ${csvRoot}` },
         { status: 500 }
@@ -57,6 +62,7 @@ export async function POST(request: NextRequest) {
     const file = formData.get("file");
 
     if (!file || !(file instanceof File)) {
+      logger.warn("CSV upload rejected — no file in form data", {}, routeName);
       return NextResponse.json(
         { error: "No file uploaded. Send a 'file' field in multipart/form-data." },
         { status: 400 }
@@ -65,7 +71,13 @@ export async function POST(request: NextRequest) {
 
     // Validate filename — must end in .csv
     const filename = file.name;
+    logger.info("CSV upload — file received", {
+      filename,
+      sizeBytes: file.size,
+      type: file.type,
+    }, routeName);
     if (!filename.toLowerCase().endsWith(".csv")) {
+      logger.warn("CSV upload rejected — not a .csv file", { filename }, routeName);
       return NextResponse.json(
         { error: "File must be a .csv (or .status.csv) file." },
         { status: 400 }
@@ -105,33 +117,42 @@ export async function POST(request: NextRequest) {
     const destPath = path.join(csvRoot, safeName);
     const fileExists = fsSync.existsSync(destPath);
 
-    // Save the file
-    await fs.writeFile(destPath, content);
+    // Inspect the uploaded CSV to give the client useful metadata.
+    // We do a quick line count + look for a 'status' column header.
+    const headerLine = lines[0] || "";
+    const headerCells = headerLine.split(",").map(c => c.trim().replace(/^"|"$/g, "").toLowerCase());
+    const hasStatusColumn = headerCells.includes("status");
+    const isStatusFile = safeName.toLowerCase().endsWith(".status.csv") || hasStatusColumn;
+    const hasHeader = headerCells.some(c => ["subreddit", "subreddit_name", "sub", "name", "sr"].includes(c));
+    const rowCount = Math.max(0, lines.length - (hasHeader ? 1 : 0));
 
-    // Detect what kind of file this is
-    const isStatusFile = safeName.toLowerCase().endsWith(".status.csv");
-    const firstLine = lines[0].toLowerCase();
-    const hasHeader = ["subreddit", "subreddit_name", "sub", "name", "sr"].some((col) =>
-      firstLine.includes(col)
-    );
-    const hasStatusColumn = firstLine.includes("status");
-
-    // Count rows
-    const rowCount = hasHeader ? lines.length - 1 : lines.length;
-
-    // Count statuses (if it's a status file)
+    // Build a quick statusCounts map (only if there's a status column)
     const statusCounts: Record<string, number> = {};
     if (hasStatusColumn) {
-      const headerCols = lines[0].split(",").map((c) => c.trim().toLowerCase());
-      const statusIdx = headerCols.indexOf("status");
+      const statusIdx = headerCells.indexOf("status");
       if (statusIdx >= 0) {
         for (let i = 1; i < lines.length; i++) {
-          const cols = lines[i].split(",");
-          const status = (cols[statusIdx] || "pending").trim() || "pending";
-          statusCounts[status] = (statusCounts[status] || 0) + 1;
+          const cells = lines[i].split(",");
+          const s = (cells[statusIdx] || "pending").trim().replace(/^"|"$/g, "").toLowerCase() || "pending";
+          statusCounts[s] = (statusCounts[s] || 0) + 1;
         }
       }
     }
+
+    // Save the file
+    await fs.writeFile(destPath, content);
+    const durationMs = Date.now() - start;
+    logger.info("CSV upload — file saved", {
+      filename: safeName,
+      path: destPath,
+      size: content.length,
+      rows: rowCount,
+      isStatusFile,
+      hasStatusColumn,
+      statusCounts,
+      overwritten: fileExists,
+      durationMs,
+    }, routeName);
 
     return NextResponse.json({
       ok: true,
@@ -150,6 +171,7 @@ export async function POST(request: NextRequest) {
     });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
+    logger.error("CSV upload failed", { error: message }, routeName, err instanceof Error ? err.stack : undefined);
     return NextResponse.json(
       { error: `Upload failed: ${message}` },
       { status: 500 }

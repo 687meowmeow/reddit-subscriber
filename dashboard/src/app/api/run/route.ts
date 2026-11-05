@@ -3,6 +3,7 @@ import { spawn, execSync, ChildProcess } from "child_process";
 import path from "path";
 import { promises as fs } from "fs";
 import fsSync from "fs";
+import logger from "@/lib/logger";
 
 // ============================================================
 // Display detection — ensures Chromium can open a window even
@@ -198,12 +199,29 @@ function addLog(stream: "stdout" | "stderr", text: string) {
 }
 
 export async function POST(request: NextRequest) {
+  const routeName = "POST /api/run";
   const body = await request.json().catch(() => ({}));
   const action = body.action as string;
+
+  logger.info(`Run action: ${action}`, {
+    action,
+    csv: body.csv,
+    headless: body.headless,
+    verifyOnly: body.verifyOnly,
+    reprocessFailed: body.reprocessFailed,
+    maxSubscribes: body.maxSubscribes,
+    speedMode: body.speedMode,
+    has_username: !!body.redditUsername,
+    has_password: !!body.redditPassword,
+  }, routeName);
 
   // --- START ---
   if (action === "start") {
     if (runState.process && runState.status === "running") {
+      logger.warn("Start rejected — a run is already in progress", {
+        pid: runState.pid,
+        startedAt: runState.startedAt,
+      }, routeName);
       return NextResponse.json(
         { error: "A run is already in progress. Stop it first." },
         { status: 409 }
@@ -220,6 +238,10 @@ export async function POST(request: NextRequest) {
 
     // Verify the script exists
     if (!fsSync.existsSync(scriptPath)) {
+      logger.error("Subscriber script not found", {
+        scriptPath,
+        csvRoot,
+      }, routeName);
       return NextResponse.json(
         {
           error: `Could not find reddit_browser_subscriber.py at: ${scriptPath}. Set the correct CSV Root directory in Settings.`,
@@ -232,6 +254,7 @@ export async function POST(request: NextRequest) {
 
     // Verify the CSV exists
     if (!fsSync.existsSync(csvPath)) {
+      logger.error("CSV file not found", { csvPath }, routeName);
       return NextResponse.json(
         { error: `Could not find CSV file: ${csvPath}` },
         { status: 404 }
@@ -262,8 +285,13 @@ export async function POST(request: NextRequest) {
     if (process.platform !== "win32" && body.headless !== true) {
       displayInfo = ensureDisplay();
       if (displayInfo) {
+        logger.info("Display detected", {
+          display: displayInfo.display,
+          method: displayInfo.method,
+        }, routeName);
         addLog("stderr", `[dashboard] Display: ${displayInfo.display} (${displayInfo.method})`);
       } else {
+        logger.warn("No display available — falling back to headless mode", undefined, routeName);
         // No display available — fall back to headless mode automatically
         addLog("stderr", "[dashboard] No display available — falling back to headless mode");
         addLog("stderr", "[dashboard] To see the browser, start your VNC server:");
@@ -340,12 +368,27 @@ export async function POST(request: NextRequest) {
         runState.endedAt = new Date().toISOString();
         if (signal === "SIGTERM" || signal === "SIGKILL") {
           runState.status = "stopped";
+          logger.info("Subscriber process stopped", {
+            signal,
+            pid: runState.pid,
+            duration_ms: runState.startedAt ? Date.now() - new Date(runState.startedAt).getTime() : null,
+          }, routeName);
           addLog("stderr", `[dashboard] Process stopped (signal: ${signal})`);
         } else if (code === 0) {
           runState.status = "completed";
+          logger.info("Subscriber process completed successfully", {
+            pid: runState.pid,
+            exit_code: 0,
+            duration_ms: runState.startedAt ? Date.now() - new Date(runState.startedAt).getTime() : null,
+          }, routeName);
           addLog("stderr", `[dashboard] Process completed successfully (exit code 0)`);
         } else {
           runState.status = "error";
+          logger.error("Subscriber process exited with error", {
+            pid: runState.pid,
+            exit_code: code,
+            duration_ms: runState.startedAt ? Date.now() - new Date(runState.startedAt).getTime() : null,
+          }, routeName);
           addLog("stderr", `[dashboard] Process exited with error (exit code ${code})`);
         }
         runState.process = null;
@@ -356,12 +399,22 @@ export async function POST(request: NextRequest) {
         runState.status = "error";
         runState.error = err.message;
         runState.endedAt = new Date().toISOString();
+        logger.error("Subscriber spawn error", {
+          error: err.message,
+          command: `${pyCmd} ${args.join(" ")}`,
+        }, routeName, err.stack);
         addLog("stderr", `[dashboard] Spawn error: ${err.message}`);
         addLog("stderr", `[dashboard] Tried to run: ${pyCmd} ${args.join(" ")}`);
         addLog("stderr", `[dashboard] If python3 is not found, try setting the Python command in Settings.`);
         runState.process = null;
         runState.pid = null;
       });
+
+      logger.info("Subscriber process started", {
+        pid: child.pid,
+        command: `${pyCmd} ${args.join(" ")}`,
+        display: displayInfo?.display || "headless",
+      }, routeName);
 
       return NextResponse.json({
         ok: true,
@@ -373,6 +426,9 @@ export async function POST(request: NextRequest) {
       runState.status = "error";
       runState.error = err instanceof Error ? err.message : String(err);
       runState.endedAt = new Date().toISOString();
+      logger.error("Subscriber failed to start", {
+        error: runState.error,
+      }, routeName, err instanceof Error ? err.stack : undefined);
       addLog("stderr", `[dashboard] Failed to start: ${runState.error}`);
       return NextResponse.json(
         { error: `Failed to start: ${runState.error}` },
@@ -384,6 +440,10 @@ export async function POST(request: NextRequest) {
   // --- CONTINUE ---
   if (action === "continue") {
     if (!runState.process || runState.status !== "waiting-for-login") {
+      logger.warn("Continue rejected — script not waiting for login", {
+        currentStatus: runState.status,
+        hasProcess: !!runState.process,
+      }, routeName);
       return NextResponse.json(
         { error: "Script is not waiting for login. Current status: " + runState.status },
         { status: 409 }
@@ -392,6 +452,9 @@ export async function POST(request: NextRequest) {
     try {
       runState.process.stdin?.write("\n");
       runState.status = "running";
+      logger.info("Sent Enter to script — continuing past login prompt", {
+        pid: runState.pid,
+      }, routeName);
       addLog("stderr", "[dashboard] Sent Enter to script — continuing past login prompt");
       return NextResponse.json({ ok: true, message: "Sent Enter to script" });
     } catch (err) {
@@ -405,9 +468,11 @@ export async function POST(request: NextRequest) {
   // --- STOP ---
   if (action === "stop") {
     if (!runState.process) {
+      logger.warn("Stop rejected — no process running", undefined, routeName);
       return NextResponse.json({ error: "No process is running" }, { status: 409 });
     }
     try {
+      logger.info("Sending SIGTERM to subscriber process", { pid: runState.pid }, routeName);
       runState.process.kill("SIGTERM");
       setTimeout(() => {
         if (runState.process) {

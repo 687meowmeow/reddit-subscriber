@@ -2,24 +2,38 @@ import { NextRequest, NextResponse } from "next/server";
 import { promises as fs } from "fs";
 import path from "path";
 import fsSync from "fs";
+import { spawn } from "child_process";
+import logger from "@/lib/logger";
 
 // ============================================================
-// Find similar subreddits for a banned subreddit.
+// Find similar subreddits for a (typically banned) subreddit.
 //
 // POST /api/find-similar
-// Body: {
-//   subreddit: "animepanties",   // the banned subreddit name
-// }
+// Body: { subreddit: "animepanties", csv: "subscribed_subreddits.status.csv" }
+//
+// CRITICAL CONTEXT (as of late May 2026):
+//   Reddit killed unauthenticated .json endpoint access. Plain
+//   fetch('https://www.reddit.com/r/NAME/about.json') now returns
+//   403 Forbidden HTML. The ONLY way to get JSON from Reddit is via
+//   an authenticated browser session.
+//
+//   We solve this by spawning a Python helper script
+//   (find_similar_helper.py) that uses Playwright with the saved
+//   browser profile (~/.reddit_subscriber_profile) — the same
+//   profile the main subscriber script uses, so login cookies are
+//   shared. This is the same approach that works for the
+//   sync-subscriptions endpoint.
 //
 // Algorithm:
-// 1. Fetch the banned subreddit's about.json (even banned subs return
-//    some metadata: title, description, public_description)
-// 2. Extract keywords from the name + description
-// 3. Search /subreddits/search.json?q={keywords} for matching communities
-// 4. For each result, check if it's already in the user's CSV
-// 5. Filter out: private, quarantined, <100 subscribers
-// 6. Rank by keyword relevance + subscriber count
-// 7. Return the top 20 results with metadata
+//   1. Spawn find_similar_helper.py with the subreddit name
+//   2. Python fetches /r/NAME/about.json (gets description, subscribers)
+//   3. Python extracts keywords from name + description
+//   4. Python searches /subreddits/search.json?q=KEYWORDS (multiple
+//      query strategies)
+//   5. Python returns combined JSON
+//   6. TS filters out private/quarantined/<100 subs
+//   7. TS scores by keyword relevance + checks if already in CSV
+//   8. Returns top 20 results
 // ============================================================
 
 async function getCsvRoot(): Promise<string> {
@@ -41,100 +55,14 @@ async function getCsvRoot(): Promise<string> {
   return path.resolve(process.cwd(), "..");
 }
 
-// Fetch JSON from Reddit with proper User-Agent.
-// Detects HTML responses (login page / rate-limit page) and throws a
-// clear error instead of letting `res.json()` fail with a confusing
-// "Unexpected token <" message.
-async function fetchRedditJson(url: string): Promise<any> {
-  const res = await fetch(url, {
-    headers: {
-      "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-      "Accept": "application/json, text/plain, */*",
-      "Accept-Language": "en-US,en;q=0.9",
-    },
-    signal: AbortSignal.timeout(15000),
-  });
-  if (!res.ok) {
-    throw new Error(`HTTP ${res.status}: ${url}`);
-  }
-  // Read the body as text first, then check it actually looks like JSON.
-  // Reddit serves HTML for some endpoints when:
-  //   - rate-limited ("Whoa there, pardner!" page)
-  //   - not logged in (login redirect)
-  //   - subreddit is banned/private
-  // In those cases the body starts with "<!DOCTYPE html>" or "<html".
-  const text = await res.text();
-  const stripped = text.replace(/^\s+/, "");
-  if (!stripped.startsWith("{") && !stripped.startsWith("[")) {
-    // Extract a short snippet for the error message
-    const snippet = stripped.replace(/\s+/g, " ").slice(0, 120);
-    throw new Error(
-      `Reddit returned HTML instead of JSON (probably rate-limited or login page). Snippet: "${snippet}"`
-    );
-  }
+async function getConfig(): Promise<any> {
+  const configFile = path.join(process.cwd(), ".config.json");
   try {
-    return JSON.parse(text);
-  } catch (err) {
-    throw new Error(`Failed to parse Reddit JSON: ${err instanceof Error ? err.message : String(err)}`);
+    const data = await fs.readFile(configFile, "utf-8");
+    return JSON.parse(data);
+  } catch {
+    return {};
   }
-}
-
-// Extract keywords from a subreddit name + description
-function extractKeywords(name: string, description: string): string[] {
-  const keywords = new Set<string>();
-
-  // Split the subreddit name into words (camelCase, snake_case, etc.)
-  // e.g. "animepanties" → ["anime", "panties"]
-  //      "Anime_Panties" → ["anime", "panties"]
-  //      "GirlsInPajamas" → ["girls", "in", "pajamas"]
-  const nameWords = name
-    .replace(/([a-z])([A-Z])/g, "$1 $2")  // camelCase split
-    .replace(/[_\-\s]+/g, " ")              // snake/kebab to spaces
-    .toLowerCase()
-    .split(" ")
-    .filter(w => w.length >= 3);            // skip short words
-
-  for (const word of nameWords) {
-    keywords.add(word);
-  }
-
-  // Extract keywords from the description
-  const descWords = description
-    .toLowerCase()
-    .replace(/[^a-z0-9\s]/g, " ")
-    .split(" ")
-    .filter(w => w.length >= 4);  // only words >= 4 chars from description
-
-  // Common stop words to exclude
-  const stopWords = new Set([
-    "this", "that", "with", "from", "have", "they", "will", "what",
-    "when", "your", "about", "which", "their", "would", "there",
-    "could", "other", "more", "some", "than", "very", "just",
-    "into", "over", "such", "also", "after", "before", "been",
-    "were", "them", "these", "those", "only", "then", "where",
-    "here", "post", "share", "like", "subreddit", "community",
-    "reddit", "content", "discussion", "please", "follow",
-    "rules", "must", "should", "posts", "images", "videos",
-    "picture", "photo", "photos",
-  ]);
-
-  // Add top description keywords (max 5)
-  const descKeywordCounts: Record<string, number> = {};
-  for (const word of descWords) {
-    if (!stopWords.has(word)) {
-      descKeywordCounts[word] = (descKeywordCounts[word] || 0) + 1;
-    }
-  }
-  const topDescKeywords = Object.entries(descKeywordCounts)
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, 5)
-    .map(([word]) => word);
-
-  for (const word of topDescKeywords) {
-    keywords.add(word);
-  }
-
-  return Array.from(keywords).slice(0, 8);  // max 8 keywords
 }
 
 // Check if a subreddit is already in the user's CSV
@@ -148,7 +76,6 @@ async function isAlreadyInCsv(
   try {
     const text = await fs.readFile(csvPath, "utf-8");
     const normalizedName = subredditName.toLowerCase();
-    // Quick check — just search the text
     return text.toLowerCase().includes(normalizedName);
   } catch {
     return false;
@@ -166,150 +93,287 @@ interface SimilarSubreddit {
   url: string;
 }
 
-export async function POST(request: NextRequest) {
-  try {
-    const body = await request.json().catch(() => ({}));
-    const subredditName = (body.subreddit || "").trim();
-    const csvName = body.csv;  // CSV filename passed from the client
+interface HelperResult {
+  ok: boolean;
+  subreddit?: string;
+  display_name?: string;
+  description?: string;
+  subscribers?: number;
+  is_nsfw?: boolean;
+  is_banned?: boolean;
+  is_private?: boolean;
+  keywords?: string[];
+  search_results?: Array<{
+    name: string;
+    display_name: string;
+    subscribers: number;
+    description: string;
+    is_nsfw: boolean;
+    is_quarantined: boolean;
+    subreddit_type: string;
+    url: string;
+  }>;
+  queries_used?: string[];
+  error?: string;
+}
 
-    if (!subredditName) {
-      return NextResponse.json(
-        { error: "Missing 'subreddit' field" },
-        { status: 400 }
-      );
-    }
+// Spawn the Python helper and return its parsed JSON output
+async function runPythonHelper(
+  pythonCmd: string,
+  scriptPath: string,
+  csvRoot: string,
+  subreddit: string
+): Promise<HelperResult> {
+  const profileDir = path.join(
+    process.env.HOME || process.env.USERPROFILE || "/root",
+    ".reddit_subscriber_profile"
+  );
 
-    // Strip r/ prefix
-    const cleanName = subredditName.replace(/^r\//i, "").replace(/^\/r\//i, "");
-
-    // Reject user profiles — Find Similar searches /subreddits/search.json
-    // which is subreddit-only. Trying to fetch /r/u_NAME/about.json would
-    // 404 and the keyword extraction would fall back to the bare name,
-    // giving useless results.
-    if (cleanName.toLowerCase().startsWith("u_") || cleanName.toLowerCase().startsWith("u/")) {
-      return NextResponse.json(
-        {
-          error: `"${cleanName}" looks like a user profile (u_ prefix). Find Similar only works for subreddits, not user accounts.`,
+  return new Promise<HelperResult>((resolve, reject) => {
+    const child = spawn(
+      pythonCmd,
+      [scriptPath, "--subreddit", subreddit, "--csv-root", csvRoot],
+      {
+        cwd: csvRoot,
+        env: {
+          ...process.env,
+          PYTHONUNBUFFERED: "1",
+          REDDIT_PROFILE_DIR: profileDir,
         },
-        { status: 400 }
-      );
-    }
-
-    const csvRoot = await getCsvRoot();
-
-    // Step 1: Fetch the banned subreddit's about.json
-    // Even banned subreddits return metadata (title, description)
-    let description = "";
-    let displayName = cleanName;
-    try {
-      const aboutData = await fetchRedditJson(
-        `https://www.reddit.com/r/${encodeURIComponent(cleanName)}/about.json`
-      );
-      const data = aboutData?.data;
-      if (data) {
-        description = data.public_description || data.description || "";
-        displayName = data.display_name || cleanName;
+        stdio: ["pipe", "pipe", "pipe"],
       }
-    } catch {
-      // If we can't fetch about.json, proceed with just the name.
-      // This happens for banned subs that don't return about.json —
-      // we'll just extract keywords from the name itself.
-    }
+    );
 
-    // Step 2: Extract keywords
-    const keywords = extractKeywords(cleanName, description);
-    if (keywords.length === 0) {
-      return NextResponse.json({
-        subreddit: cleanName,
-        keywords: [],
-        results: [],
-        message: "Could not extract keywords from subreddit name",
-      });
-    }
+    let stdout = "";
+    let stderr = "";
 
-    // Step 3: Search for similar subreddits using keywords
-    const searchQuery = keywords.slice(0, 4).join(" ");
-    let searchResults: any[] = [];
-    try {
-      const searchData = await fetchRedditJson(
-        `https://www.reddit.com/subreddits/search.json?q=${encodeURIComponent(searchQuery)}&limit=25&sort=relevance`
-      );
-      searchResults = searchData?.data?.children?.map((c: any) => c.data) || [];
-    } catch {
-      // Search failed — try with fewer keywords
+    child.stdout.on("data", (data: Buffer) => { stdout += data.toString(); });
+    child.stderr.on("data", (data: Buffer) => { stderr += data.toString(); });
+
+    // 90-second timeout — multiple Reddit fetches + search
+    const timeout = setTimeout(() => {
+      child.kill("SIGKILL");
+      logger.warn("Python helper timed out", {
+        subreddit,
+        stdout_length: stdout.length,
+        stderr_tail: stderr.slice(-300),
+      }, "POST /api/find-similar");
+      reject(new Error("Find Similar script timed out after 90 seconds. Reddit may be slow or rate-limiting."));
+    }, 90000);
+
+    child.on("exit", (code) => {
+      clearTimeout(timeout);
       try {
-        const searchData = await fetchRedditJson(
-          `https://www.reddit.com/subreddits/search.json?q=${encodeURIComponent(keywords[0])}&limit=25`
-        );
-        searchResults = searchData?.data?.children?.map((c: any) => c.data) || [];
-      } catch {}
-    }
-
-    // Step 4: Process results
-    const results: SimilarSubreddit[] = [];
-    const seen = new Set<string>();
-
-    for (const sub of searchResults) {
-      const name = sub.display_name || "";
-      if (!name || name.toLowerCase() === cleanName.toLowerCase()) continue;
-      if (seen.has(name.toLowerCase())) continue;
-      seen.add(name.toLowerCase());
-
-      // Skip private, quarantined subreddits
-      if (sub.subreddit_type === "private" || sub.quarantine) continue;
-
-      const subscribers = sub.subscribers || 0;
-
-      // Skip tiny subreddits (< 100 subscribers)
-      if (subscribers < 100) continue;
-
-      // Calculate relevance score based on keyword overlap
-      const subNameLower = (sub.display_name || "").toLowerCase();
-      const subDescLower = (sub.public_description || "").toLowerCase();
-      let relevanceScore = 0;
-      for (const kw of keywords) {
-        if (subNameLower.includes(kw)) relevanceScore += 3;
-        if (subDescLower.includes(kw)) relevanceScore += 1;
+        // Parse the LAST line of stdout (JSON output)
+        const lines = stdout.trim().split("\n").filter((l) => l.trim());
+        const lastLine = lines[lines.length - 1];
+        if (!lastLine) {
+          logger.error("Python helper produced no output", {
+            subreddit,
+            code,
+            stdout_tail: stdout.slice(-500),
+            stderr_tail: stderr.slice(-500),
+          }, "POST /api/find-similar");
+          reject(new Error(
+            `Find Similar script produced no output. stderr: ${stderr.slice(-300)}`
+          ));
+          return;
+        }
+        const data = JSON.parse(lastLine) as HelperResult;
+        logger.debug("Python helper exited", {
+          subreddit,
+          exit_code: code,
+          ok: data.ok,
+          results_count: data.search_results?.length || 0,
+          stderr_lines: stderr.split("\n").filter(l => l.trim()).length,
+        }, "POST /api/find-similar");
+        resolve(data);
+      } catch (e) {
+        logger.error("Failed to parse Python helper output", {
+          subreddit,
+          error: e instanceof Error ? e.message : String(e),
+          stdout_tail: stdout.slice(-500),
+          stderr_tail: stderr.slice(-300),
+        }, "POST /api/find-similar");
+        reject(new Error(
+          `Failed to parse Find Similar script output: ${stdout.slice(-500)} | stderr: ${stderr.slice(-300)}`
+        ));
       }
-
-      // Check if already in CSV
-      const alreadyInCsv = await isAlreadyInCsv(csvRoot, csvName, name);
-
-      results.push({
-        name,
-        display_name: sub.title || sub.display_name || name,
-        subscribers,
-        description: sub.public_description || "",
-        is_nsfw: sub.over18 === true,
-        relevance_score: relevanceScore,
-        already_in_csv: alreadyInCsv,
-        url: `https://www.reddit.com/r/${name}`,
-      });
-    }
-
-    // Step 5: Sort by relevance score (then by subscribers)
-    results.sort((a, b) => {
-      if (b.relevance_score !== a.relevance_score) {
-        return b.relevance_score - a.relevance_score;
-      }
-      return b.subscribers - a.subscribers;
     });
 
-    // Return top 20
-    const topResults = results.slice(0, 20);
-
-    return NextResponse.json({
-      subreddit: cleanName,
-      display_name: displayName,
-      keywords,
-      results: topResults,
-      total_found: results.length,
+    child.on("error", (err) => {
+      clearTimeout(timeout);
+      logger.error("Failed to spawn Python helper", {
+        subreddit,
+        error: err.message,
+        pythonCmd,
+        scriptPath,
+      }, "POST /api/find-similar");
+      reject(new Error(`Failed to spawn Python helper: ${err.message}`));
     });
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
+  });
+}
+
+export async function POST(request: NextRequest) {
+  const startTime = Date.now();
+  const routeName = "POST /api/find-similar";
+  const body = await request.json().catch(() => ({}));
+  const subredditName = (body.subreddit || "").trim();
+  const csvName = body.csv;
+
+  logger.info("Find Similar request received", {
+    subreddit: subredditName,
+    csv: csvName,
+  }, routeName);
+
+  if (!subredditName) {
+    logger.warn("Missing subreddit field in request", undefined, routeName);
     return NextResponse.json(
-      { error: `Failed to find similar subreddits: ${message}` },
+      { error: "Missing 'subreddit' field" },
+      { status: 400 }
+    );
+  }
+
+  // Strip r/ prefix
+  const cleanName = subredditName.replace(/^r\//i, "").replace(/^\/r\//i, "");
+
+  // Reject user profiles
+  if (cleanName.toLowerCase().startsWith("u_") || cleanName.toLowerCase().startsWith("u/")) {
+    logger.warn("Rejected user profile (Find Similar only works for subreddits)", {
+      subreddit: cleanName,
+    }, routeName);
+    return NextResponse.json(
+      {
+        error: `"${cleanName}" looks like a user profile (u_ prefix). Find Similar only works for subreddits, not user accounts.`,
+      },
+      { status: 400 }
+    );
+  }
+
+  const config = await getConfig();
+  const csvRoot = config.csvRoot || path.resolve(process.cwd(), "..");
+  const pythonCmd = config.pythonCmd || "python3";
+  const scriptPath = path.join(csvRoot, "find_similar_helper.py");
+
+  if (!fsSync.existsSync(scriptPath)) {
+    logger.error("find_similar_helper.py not found", {
+      expected_path: scriptPath,
+      csvRoot,
+    }, routeName);
+    return NextResponse.json(
+      {
+        error: `Find Similar helper script not found at: ${scriptPath}. Make sure your CSV root is set correctly.`,
+      },
       { status: 500 }
     );
   }
+
+  // Run the Python helper
+  let helperResult: HelperResult;
+  try {
+    helperResult = await runPythonHelper(pythonCmd, scriptPath, csvRoot, cleanName);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    logger.error("Python helper execution failed", {
+      subreddit: cleanName,
+      error: msg,
+      duration_ms: Date.now() - startTime,
+    }, routeName);
+    return NextResponse.json(
+      { error: `Find Similar failed: ${msg}` },
+      { status: 500 }
+    );
+  }
+
+  if (!helperResult.ok) {
+    logger.warn("Python helper returned error", {
+      subreddit: cleanName,
+      error: helperResult.error,
+      duration_ms: Date.now() - startTime,
+    }, routeName);
+    return NextResponse.json(
+      { error: helperResult.error || "Find Similar failed" },
+      { status: 500 }
+    );
+  }
+
+  const keywords = helperResult.keywords || [];
+  const rawResults = helperResult.search_results || [];
+
+  logger.info("Python helper succeeded", {
+    subreddit: cleanName,
+    keywords,
+    raw_results_count: rawResults.length,
+    queries_used: helperResult.queries_used,
+    duration_ms: Date.now() - startTime,
+  }, routeName);
+
+  // Score and filter results
+  const results: SimilarSubreddit[] = [];
+  const seen = new Set<string>();
+
+  for (const sub of rawResults) {
+    const name = sub.name || "";
+    if (!name || name.toLowerCase() === cleanName.toLowerCase()) continue;
+    if (seen.has(name.toLowerCase())) continue;
+    seen.add(name.toLowerCase());
+
+    // Skip private/quarantined (extra safety; Python already filters these)
+    if ((sub.subreddit_type || "").toLowerCase() === "private") continue;
+    if (sub.is_quarantined) continue;
+    if (sub.subscribers < 100) continue;
+
+    // Calculate relevance score based on keyword overlap
+    const subNameLower = name.toLowerCase();
+    const subDescLower = (sub.description || "").toLowerCase();
+    let relevanceScore = 0;
+    for (const kw of keywords) {
+      if (subNameLower.includes(kw)) relevanceScore += 3;
+      if (subDescLower.includes(kw)) relevanceScore += 1;
+    }
+
+    // Check if already in CSV
+    const alreadyInCsv = await isAlreadyInCsv(csvRoot, csvName, name);
+
+    results.push({
+      name,
+      display_name: sub.display_name || name,
+      subscribers: sub.subscribers,
+      description: sub.description || "",
+      is_nsfw: sub.is_nsfw,
+      relevance_score: relevanceScore,
+      already_in_csv: alreadyInCsv,
+      url: sub.url || `https://www.reddit.com/r/${name}`,
+    });
+  }
+
+  // Sort by relevance score (then by subscribers)
+  results.sort((a, b) => {
+    if (b.relevance_score !== a.relevance_score) {
+      return b.relevance_score - a.relevance_score;
+    }
+    return b.subscribers - a.subscribers;
+  });
+
+  // Return top 25 (was 20; bumped because Reddit's search is less precise)
+  const topResults = results.slice(0, 25);
+
+  logger.info("Find Similar complete", {
+    subreddit: cleanName,
+    keywords,
+    final_results_count: topResults.length,
+    duration_ms: Date.now() - startTime,
+  }, routeName);
+
+  return NextResponse.json({
+    subreddit: cleanName,
+    display_name: helperResult.display_name || cleanName,
+    description: helperResult.description || "",
+    keywords,
+    is_banned: helperResult.is_banned || false,
+    is_private: helperResult.is_private || false,
+    results: topResults,
+    total_found: results.length,
+    queries_used: helperResult.queries_used || [],
+  });
 }
