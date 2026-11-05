@@ -238,6 +238,7 @@ export default function Home() {
   const [search, setSearch] = useState<string>("");
   const [statusFilter, setStatusFilter] = useState<string>("all");
   const [nsfwFilter, setNsfwFilter] = useState<"all" | "sfw" | "nsfw">("all");
+  const [typeFilter, setTypeFilter] = useState<"all" | "subreddit" | "account">("all");
   // Limit visible rows for performance — rendering 4035 rows at once
   // makes the page extremely laggy. Show 100, load more on demand.
   const [visibleCount, setVisibleCount] = useState<number>(100);
@@ -256,6 +257,12 @@ export default function Home() {
   const [similarSort, setSimilarSort] = useState<"relevance" | "subscribers">("relevance");
   const [similarNsfwFilter, setSimilarNsfwFilter] = useState<"all" | "sfw" | "nsfw">("all");
   const [similarMinSubs, setSimilarMinSubs] = useState<number>(0);
+  // Manual subreddit input for Find Similar panel
+  const [similarInput, setSimilarInput] = useState<string>("");
+
+  // Sync subscriptions state
+  const [syncing, setSyncing] = useState<boolean>(false);
+  const [syncResult, setSyncResult] = useState<any>(null);
 
   // Settings state
   const [showSettings, setShowSettings] = useState<boolean>(false);
@@ -464,7 +471,7 @@ export default function Home() {
       const res = await fetch("/api/find-similar", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ subreddit: subredditName }),
+        body: JSON.stringify({ subreddit: subredditName, csv: selectedCsv }),
       });
       const data = await res.json();
       if (!res.ok) {
@@ -478,7 +485,30 @@ export default function Home() {
     } finally {
       setSimilarLoading(false);
     }
-  }, []);
+  }, [selectedCsv]);
+
+  // Sync subscriptions — fetch live subscribed list from Reddit and add missing to CSV
+  const syncSubscriptions = useCallback(async () => {
+    setSyncing(true);
+    setSyncResult(null);
+    try {
+      const res = await fetch("/api/sync-subscriptions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ csv: selectedCsv }),
+      });
+      const data = await res.json();
+      setSyncResult(data);
+      if (data.ok) {
+        // Refresh the CSV data to show the new rows
+        fetchCsvData(selectedCsv);
+      }
+    } catch (err) {
+      setSyncResult({ error: err instanceof Error ? err.message : String(err) });
+    } finally {
+      setSyncing(false);
+    }
+  }, [selectedCsv, fetchCsvData]);
 
   const handleFileUpload = useCallback(async (file: File) => {
     setUploading(true);
@@ -605,7 +635,7 @@ export default function Home() {
   // Reset visible count when filters change
   useEffect(() => {
     setVisibleCount(100);
-  }, [statusFilter, nsfwFilter]);
+  }, [statusFilter, nsfwFilter, typeFilter]);
 
   // Filtered rows for the table
   const filteredRows = useMemo(() => {
@@ -615,14 +645,32 @@ export default function Home() {
       const name = (row[subCol] || "").toLowerCase();
       // search (uses debounced value)
       if (debouncedSearch && !name.includes(debouncedSearch.toLowerCase())) return false;
-      // status filter
+      // type filter (account vs subreddit)
+      if (typeFilter !== "all") {
+        const isAccount = name.startsWith("u_") || name.startsWith("u/");
+        if (typeFilter === "account" && !isAccount) return false;
+        if (typeFilter === "subreddit" && isAccount) return false;
+      }
+      // status filter — supports both category filters (done/failed/terminal)
+      // and individual status filters (banned, private, not_found, etc.)
       if (statusFilter !== "all") {
         const status = (row.status || "pending").trim().toLowerCase() || "pending";
-        const category = STATUS_CONFIG[status]?.category || "pending";
-        if (statusFilter === "done" && category !== "done") return false;
-        if (statusFilter === "failed" && category !== "retryable") return false;
-        if (statusFilter === "terminal" && category !== "terminal") return false;
-        if (statusFilter === "pending" && status !== "pending") return false;
+        // Category filters
+        if (statusFilter === "done") {
+          const category = STATUS_CONFIG[status]?.category || "pending";
+          if (category !== "done") return false;
+        } else if (statusFilter === "failed") {
+          const category = STATUS_CONFIG[status]?.category || "pending";
+          if (category !== "retryable") return false;
+        } else if (statusFilter === "terminal") {
+          const category = STATUS_CONFIG[status]?.category || "pending";
+          if (category !== "terminal") return false;
+        } else if (statusFilter === "pending") {
+          if (status !== "pending") return false;
+        } else {
+          // Individual status filter (e.g. "banned", "private", "not_found")
+          if (status !== statusFilter) return false;
+        }
       }
       // NSFW filter
       if (nsfwFilter !== "all") {
@@ -632,7 +680,7 @@ export default function Home() {
       }
       return true;
     });
-  }, [csvData, debouncedSearch, statusFilter, nsfwFilter]);
+  }, [csvData, debouncedSearch, statusFilter, nsfwFilter, typeFilter]);
 
   // Only render the first `visibleCount` rows — this is the key to
   // eliminating UI lag. Rendering 4035 <tr> elements every refresh
@@ -749,6 +797,40 @@ export default function Home() {
                 <Upload className="w-4 h-4" />
               )}
               <span className="hidden sm:inline">Import CSV</span>
+            </Button>
+
+            {/* Sync Subscriptions — fetch live list from Reddit and add missing subs to CSV */}
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={syncSubscriptions}
+              disabled={syncing}
+              title="Fetch your live subscribed subreddits from Reddit and add any missing ones to the CSV"
+              className="gap-1.5"
+            >
+              {syncing ? (
+                <Loader2 className="w-4 h-4 animate-spin" />
+              ) : (
+                <RefreshCw className="w-4 h-4" />
+              )}
+              <span className="hidden sm:inline">Sync</span>
+            </Button>
+
+            {/* Find Similar — opens the panel with a subreddit picker */}
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => {
+                setShowFindSimilar(true);
+                setSimilarFor("");
+                setSimilarResults([]);
+                setSimilarError(null);
+              }}
+              title="Find similar subreddits to banned ones"
+              className="gap-1.5"
+            >
+              <Search className="w-4 h-4" />
+              <span className="hidden sm:inline">Find Similar</span>
             </Button>
 
             {/* Settings button */}
@@ -1431,10 +1513,31 @@ export default function Home() {
             </SelectTrigger>
             <SelectContent>
               <SelectItem value="all">All statuses</SelectItem>
-              <SelectItem value="done">Subscribed</SelectItem>
+              <SelectItem value="done">✓ Subscribed (all)</SelectItem>
               <SelectItem value="pending">Pending</SelectItem>
               <SelectItem value="failed">Failed</SelectItem>
-              <SelectItem value="terminal">Terminal</SelectItem>
+              <SelectItem value="terminal">✗ Terminal (all)</SelectItem>
+              <SelectItem value="subscribed">— Subscribed</SelectItem>
+              <SelectItem value="already_subscribed">— Already Subscribed</SelectItem>
+              <SelectItem value="followed">— Followed</SelectItem>
+              <SelectItem value="already_followed">— Already Following</SelectItem>
+              <SelectItem value="banned">— Banned</SelectItem>
+              <SelectItem value="private">— Private</SelectItem>
+              <SelectItem value="quarantined">— Quarantined</SelectItem>
+              <SelectItem value="not_found">— Not Found</SelectItem>
+              <SelectItem value="shadowbanned">— Shadowbanned</SelectItem>
+              <SelectItem value="aborted">— Aborted</SelectItem>
+            </SelectContent>
+          </Select>
+          {/* Type filter: subreddit vs user account */}
+          <Select value={typeFilter} onValueChange={(v) => setTypeFilter(v as "all" | "subreddit" | "account")}>
+            <SelectTrigger className="w-[110px] sm:w-[130px]">
+              <SelectValue placeholder="All types" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">All types</SelectItem>
+              <SelectItem value="subreddit">Subreddits</SelectItem>
+              <SelectItem value="account">Accounts</SelectItem>
             </SelectContent>
           </Select>
           <Select value={nsfwFilter} onValueChange={(v) => setNsfwFilter(v as typeof nsfwFilter)}>
@@ -1509,6 +1612,58 @@ export default function Home() {
               </CardTitle>
             </CardHeader>
             <CardContent className="pt-4 space-y-3">
+              {/* Manual subreddit input — search any subreddit */}
+              <div className="flex gap-2">
+                <Input
+                  placeholder="Enter any subreddit name (e.g. animepanties)..."
+                  value={similarInput}
+                  onChange={(e) => setSimilarInput(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" && similarInput.trim()) {
+                      findSimilar(similarInput.trim());
+                    }
+                  }}
+                  className="flex-1"
+                />
+                <Button
+                  size="sm"
+                  onClick={() => similarInput.trim() && findSimilar(similarInput.trim())}
+                  disabled={similarLoading || !similarInput.trim()}
+                >
+                  {similarLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Search className="w-4 h-4" />}
+                  Search
+                </Button>
+              </div>
+
+              {/* Sync result display */}
+              {syncResult && (
+                <div className={cn(
+                  "p-3 rounded-lg text-sm border",
+                  syncResult.error
+                    ? "bg-red-50 dark:bg-red-950/30 border-red-200 dark:border-red-800 text-red-700 dark:text-red-300"
+                    : "bg-emerald-50 dark:bg-emerald-950/30 border-emerald-200 dark:border-emerald-800 text-emerald-700 dark:text-emerald-300"
+                )}>
+                  {syncResult.error ? (
+                    <p>Sync failed: {syncResult.error}</p>
+                  ) : (
+                    <div>
+                      <p className="font-medium">{syncResult.message}</p>
+                      {syncResult.total_live > 0 && (
+                        <p className="text-xs mt-1">
+                          Live subscriptions on Reddit: {syncResult.total_live}
+                        </p>
+                      )}
+                      {syncResult.added_names && syncResult.added_names.length > 0 && (
+                        <p className="text-xs mt-1">
+                          Added: {syncResult.added_names.join(", ")}
+                          {syncResult.added > 10 && ` ...and ${syncResult.added - 10} more`}
+                        </p>
+                      )}
+                    </div>
+                  )}
+                </div>
+              )}
+
               {/* Keywords */}
               {similarKeywords.length > 0 && (
                 <div className="flex items-center gap-2 flex-wrap">

@@ -148,6 +148,7 @@ export async function POST(request: NextRequest) {
   try {
     const body = await request.json().catch(() => ({}));
     const subredditName = (body.subreddit || "").trim();
+    const csvName = body.csv;  // CSV filename passed from the client
 
     if (!subredditName) {
       return NextResponse.json(
@@ -160,15 +161,6 @@ export async function POST(request: NextRequest) {
     const cleanName = subredditName.replace(/^r\//i, "").replace(/^\/r\//i, "");
 
     const csvRoot = await getCsvRoot();
-
-    // Read config to get the selected CSV (for "already in CSV" check)
-    const configFile = path.join(process.cwd(), ".config.json");
-    let csvName: string | undefined;
-    try {
-      const configData = await fs.readFile(configFile, "utf-8");
-      const config = JSON.parse(configData);
-      csvName = config.lastSelectedCsv;
-    } catch {}
 
     // Step 1: Fetch the banned subreddit's about.json
     // Even banned subreddits return metadata (title, description)
