@@ -9,7 +9,7 @@ import {
   CheckCircle2, XCircle, AlertCircle, Clock, Users, RefreshCw, Search,
   Loader2, FileText, Activity, Ban, Lock, ShieldAlert, Eye, EyeOff,
   ChevronDown, Filter, ExternalLink, Bug, Play, Square, Terminal, Settings,
-  Github, Upload, Copy, Check, Download,
+  Github, Upload, Copy, Check, Download, Pencil,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -1550,24 +1550,69 @@ export default function Home() {
                                 </div>
                               </td>
 
-                              {/* Status */}
+                              {/* Status (with edit dropdown) */}
                               <td className="px-4 py-3">
-                                <TooltipProvider>
-                                  <Tooltip>
-                                    <TooltipTrigger asChild>
-                                      <Badge
-                                        variant="outline"
-                                        className={cn("gap-1.5", info.color, info.bg, info.border)}
-                                      >
-                                        <StatusIcon className="w-3 h-3" />
-                                        {info.label}
-                                      </Badge>
-                                    </TooltipTrigger>
-                                    <TooltipContent side="top">
-                                      <p className="max-w-xs">{info.description}</p>
-                                    </TooltipContent>
-                                  </Tooltip>
-                                </TooltipProvider>
+                                <div className="flex items-center gap-1.5">
+                                  <TooltipProvider>
+                                    <Tooltip>
+                                      <TooltipTrigger asChild>
+                                        <Badge
+                                          variant="outline"
+                                          className={cn("gap-1.5", info.color, info.bg, info.border)}
+                                        >
+                                          <StatusIcon className="w-3 h-3" />
+                                          {info.label}
+                                        </Badge>
+                                      </TooltipTrigger>
+                                      <TooltipContent side="top">
+                                        <p className="max-w-xs">{info.description}</p>
+                                      </TooltipContent>
+                                    </Tooltip>
+                                  </TooltipProvider>
+                                  {/* Edit status dropdown */}
+                                  <Select
+                                    value=""
+                                    onValueChange={(newStatus) => {
+                                      // Optimistic update — immediately change the row's status in the UI
+                                      const subCol = csvData?.subCol || "subreddit";
+                                      setCsvData((prev) => prev ? {
+                                        ...prev,
+                                        rows: prev.rows.map((r) =>
+                                          r[subCol] === name ? { ...r, status: newStatus } : r
+                                        ),
+                                      } : prev);
+                                      // Send to server
+                                      fetch("/api/csv-update-row", {
+                                        method: "POST",
+                                        headers: { "Content-Type": "application/json" },
+                                        body: JSON.stringify({
+                                          csv: selectedCsv,
+                                          subreddit: name,
+                                          status: newStatus,
+                                        }),
+                                      }).catch(() => {
+                                        // On error, refresh to get the real state
+                                        fetchCsvData(selectedCsv);
+                                      });
+                                    }}
+                                  >
+                                    <SelectTrigger className="w-7 h-6 p-0 border-0 bg-transparent hover:bg-slate-200 dark:hover:bg-slate-800">
+                                      <Pencil className="w-3 h-3 text-slate-400 group-hover:text-slate-600 dark:group-hover:text-slate-300" />
+                                    </SelectTrigger>
+                                    <SelectContent>
+                                      <SelectItem value="pending">Pending</SelectItem>
+                                      <SelectItem value="subscribed">Subscribed</SelectItem>
+                                      <SelectItem value="already_subscribed">Already Subscribed</SelectItem>
+                                      <SelectItem value="followed">Followed</SelectItem>
+                                      <SelectItem value="already_followed">Already Following</SelectItem>
+                                      <SelectItem value="failed">Failed</SelectItem>
+                                      <SelectItem value="banned">Banned</SelectItem>
+                                      <SelectItem value="private">Private</SelectItem>
+                                      <SelectItem value="quarantined">Quarantined</SelectItem>
+                                      <SelectItem value="not_found">Not Found</SelectItem>
+                                    </SelectContent>
+                                  </Select>
+                                </div>
                               </td>
 
                               {/* Members */}
