@@ -9,8 +9,9 @@ import {
   CheckCircle2, XCircle, AlertCircle, Clock, Users, RefreshCw, Search,
   Loader2, FileText, Activity, Ban, Lock, ShieldAlert, Eye, EyeOff,
   ChevronDown, Filter, ExternalLink, Bug, Play, Square, Terminal, Settings,
-  Github, Upload, Copy, Check, Download, Pencil,
+  Github, Upload, Copy, Check, Download, Pencil, MoreVertical, Menu as MenuIcon,
 } from "lucide-react";
+import { useRouter } from "next/navigation";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
@@ -21,6 +22,9 @@ import {
 import { Switch } from "@/components/ui/switch";
 import { Label } from "@/components/ui/label";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import {
+  Sheet, SheetContent, SheetHeader, SheetTitle, SheetTrigger, SheetClose,
+} from "@/components/ui/sheet";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 
@@ -227,6 +231,8 @@ function formatCreatedDate(created: string | undefined): string {
 // ============================================================
 
 export default function Home() {
+  const router = useRouter();
+  const [mobileMenuOpen, setMobileMenuOpen] = useState<boolean>(false);
   const [csvData, setCsvData] = useState<CsvData | null>(null);
   const [csvFiles, setCsvFiles] = useState<CsvFile[]>([]);
   const [selectedCsv, setSelectedCsv] = useState<string>("");
@@ -246,19 +252,9 @@ export default function Home() {
   const [debouncedSearch, setDebouncedSearch] = useState<string>("");
   const searchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // Find Similar feature state
-  const [showFindSimilar, setShowFindSimilar] = useState<boolean>(false);
-  const [similarLoading, setSimilarLoading] = useState<boolean>(false);
-  const [similarResults, setSimilarResults] = useState<any[]>([]);
-  const [similarFor, setSimilarFor] = useState<string>("");
-  const [similarKeywords, setSimilarKeywords] = useState<string[]>([]);
-  const [similarError, setSimilarError] = useState<string | null>(null);
-  // Filter state for similar results
-  const [similarSort, setSimilarSort] = useState<"relevance" | "subscribers">("relevance");
-  const [similarNsfwFilter, setSimilarNsfwFilter] = useState<"all" | "sfw" | "nsfw">("all");
-  const [similarMinSubs, setSimilarMinSubs] = useState<number>(0);
-  // Manual subreddit input for Find Similar panel
-  const [similarInput, setSimilarInput] = useState<string>("");
+  // NOTE: Find Similar state has moved to /find-similar (its own route).
+  // The dashboard only needs the syncResult state below to show feedback
+  // after the Sync button is clicked.
 
   // Sync subscriptions state
   const [syncing, setSyncing] = useState<boolean>(false);
@@ -459,33 +455,9 @@ export default function Home() {
   }, []);
 
   // Handle CSV file upload (import from another device)
-  // Find similar subreddits for a given (banned) subreddit
-  const findSimilar = useCallback(async (subredditName: string) => {
-    setShowFindSimilar(true);
-    setSimilarLoading(true);
-    setSimilarError(null);
-    setSimilarResults([]);
-    setSimilarFor(subredditName);
-    setSimilarKeywords([]);
-    try {
-      const res = await fetch("/api/find-similar", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ subreddit: subredditName, csv: selectedCsv }),
-      });
-      const data = await res.json();
-      if (!res.ok) {
-        setSimilarError(data.error || `HTTP ${res.status}`);
-      } else {
-        setSimilarResults(data.results || []);
-        setSimilarKeywords(data.keywords || []);
-      }
-    } catch (err) {
-      setSimilarError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setSimilarLoading(false);
-    }
-  }, [selectedCsv]);
+  // Find Similar now lives on its own page (/find-similar) —
+  // the dashboard's "Find Similar" button just navigates there,
+  // so we don't need the findSimilar callback here anymore.
 
   // Sync subscriptions — fetch live subscribed list from Reddit and add missing to CSV
   const syncSubscriptions = useCallback(async () => {
@@ -689,16 +661,22 @@ export default function Home() {
 
   return (
     <div className="min-h-screen flex flex-col bg-gradient-to-br from-slate-50 via-white to-slate-100 dark:from-slate-950 dark:via-slate-900 dark:to-slate-950">
-      {/* Header */}
+      {/* Header — compact on mobile, full on desktop.
+          The top row is logo + title + Menu button (mobile only).
+          The CSV selector and primary actions live on a second row
+          that wraps naturally. Less-used actions (Import CSV, Sync,
+          Find Similar, Settings, Debug) collapse into a Sheet on
+          small screens so they don't bloat the header. */}
       <header className="border-b border-slate-200 dark:border-slate-800 bg-white/80 dark:bg-slate-950/80 backdrop-blur-sm sticky top-0 z-10">
-        <div className="container mx-auto px-3 sm:px-4 py-3 sm:py-4 flex flex-wrap items-center gap-2 sm:gap-3">
-          <div className="flex items-center gap-2 sm:gap-3">
-            <div className="w-9 h-9 sm:w-10 sm:h-10 rounded-xl bg-gradient-to-br from-orange-500 to-red-600 flex items-center justify-center text-white shadow-md flex-shrink-0">
+        <div className="container mx-auto px-3 sm:px-4 py-2.5 sm:py-3 flex items-center gap-2 sm:gap-3">
+          <div className="flex items-center gap-2 flex-shrink-0">
+            <div className="w-8 h-8 sm:w-10 sm:h-10 rounded-lg sm:rounded-xl bg-gradient-to-br from-orange-500 to-red-600 flex items-center justify-center text-white shadow-md">
               <Activity className="w-4 h-4 sm:w-5 sm:h-5" />
             </div>
-            <div>
-              <h1 className="text-base sm:text-xl font-bold tracking-tight text-slate-900 dark:text-slate-100">
-                Reddit Subscriber Dashboard
+            <div className="min-w-0">
+              <h1 className="text-sm sm:text-xl font-bold tracking-tight text-slate-900 dark:text-slate-100 truncate">
+                <span className="sm:hidden">Reddit Subs</span>
+                <span className="hidden sm:inline">Reddit Subscriber Dashboard</span>
               </h1>
               <p className="text-[10px] sm:text-xs text-slate-500 dark:text-slate-400 hidden sm:block">
                 Live status monitor for the browser subscriber script
@@ -706,10 +684,15 @@ export default function Home() {
             </div>
           </div>
 
-          <div className="ml-auto flex flex-wrap items-center gap-2">
-            {/* CSV selector */}
+          {/* Right side actions. On mobile, only the manual refresh and
+              the "More" menu are visible. On desktop, all actions are
+              visible in a row. */}
+          <div className="ml-auto flex items-center gap-1.5 sm:gap-2">
+            {/* CSV selector — visible on desktop only (mobile uses the
+                filters row below). Hiding it on mobile keeps the header
+                to a single row. */}
             <Select value={selectedCsv} onValueChange={setSelectedCsv}>
-              <SelectTrigger className="w-[180px] sm:w-[280px]">
+              <SelectTrigger className="w-[280px] hidden sm:flex">
                 <FileText className="w-4 h-4 mr-2 text-slate-500" />
                 <SelectValue placeholder="Select CSV" />
               </SelectTrigger>
@@ -739,14 +722,14 @@ export default function Home() {
               </SelectContent>
             </Select>
 
-            {/* Auto-refresh toggle */}
-            <div className="flex items-center gap-2 px-2 sm:px-3 py-2 rounded-lg bg-slate-100 dark:bg-slate-900 border border-slate-200 dark:border-slate-800">
+            {/* Auto-refresh toggle — desktop only on this row */}
+            <div className="hidden sm:flex items-center gap-2 px-3 py-2 rounded-lg bg-slate-100 dark:bg-slate-900 border border-slate-200 dark:border-slate-800">
               <Switch
                 checked={autoRefresh}
                 onCheckedChange={setAutoRefresh}
                 id="auto-refresh"
               />
-              <Label htmlFor="auto-refresh" className="text-xs cursor-pointer hidden sm:inline">
+              <Label htmlFor="auto-refresh" className="text-xs cursor-pointer">
                 Auto-refresh
               </Label>
               {autoRefresh && (
@@ -754,7 +737,7 @@ export default function Home() {
               )}
             </div>
 
-            {/* Manual refresh */}
+            {/* Manual refresh — always visible (primary action) */}
             <Button
               variant="outline"
               size="icon"
@@ -768,72 +751,8 @@ export default function Home() {
               <RefreshCw className={cn("w-4 h-4", refreshing && "animate-spin")} />
             </Button>
 
-            {/* Import CSV — upload from another device */}
-            <input
-              ref={fileInputRef}
-              type="file"
-              accept=".csv,.status.csv"
-              className="hidden"
-              onChange={(e) => {
-                const file = e.target.files?.[0];
-                if (file) {
-                  handleFileUpload(file);
-                }
-                // Reset the input so the same file can be selected again
-                e.target.value = "";
-              }}
-            />
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => fileInputRef.current?.click()}
-              disabled={uploading}
-              title="Upload a CSV file from this device to the Pi"
-              className="gap-1.5"
-            >
-              {uploading ? (
-                <Loader2 className="w-4 h-4 animate-spin" />
-              ) : (
-                <Upload className="w-4 h-4" />
-              )}
-              <span className="hidden sm:inline">Import CSV</span>
-            </Button>
-
-            {/* Sync Subscriptions — fetch live list from Reddit and add missing subs to CSV */}
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={syncSubscriptions}
-              disabled={syncing}
-              title="Fetch your live subscribed subreddits from Reddit and add any missing ones to the CSV"
-              className="gap-1.5"
-            >
-              {syncing ? (
-                <Loader2 className="w-4 h-4 animate-spin" />
-              ) : (
-                <RefreshCw className="w-4 h-4" />
-              )}
-              <span className="hidden sm:inline">Sync</span>
-            </Button>
-
-            {/* Find Similar — opens the panel with a subreddit picker */}
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => {
-                setShowFindSimilar(true);
-                setSimilarFor("");
-                setSimilarResults([]);
-                setSimilarError(null);
-              }}
-              title="Find similar subreddits to banned ones"
-              className="gap-1.5"
-            >
-              <Search className="w-4 h-4" />
-              <span className="hidden sm:inline">Find Similar</span>
-            </Button>
-
-            {/* Settings button */}
+            {/* Settings — always visible (primary action).
+                A small green dot shows when auto-update is active. */}
             <Button
               variant="outline"
               size="icon"
@@ -842,7 +761,7 @@ export default function Home() {
                 if (!showSettings) fetchSettings();
               }}
               title="Settings — set CSV directory, Python path, and GitHub auto-update"
-              className={cn(showSettings && "bg-blue-100 dark:bg-blue-900/30 border-blue-300 dark:border-blue-700")}
+              className={cn("relative", showSettings && "bg-blue-100 dark:bg-blue-900/30 border-blue-300 dark:border-blue-700")}
             >
               <Settings className="w-4 h-4" />
               {settings.autoUpdate && settings.githubRepo && (
@@ -850,7 +769,217 @@ export default function Home() {
               )}
             </Button>
 
-            {/* Debug button */}
+            {/* "More" menu (mobile only) — opens a Sheet containing
+                Import CSV, Sync, Find Similar, Debug, Auto-refresh
+                toggle, and the CSV selector. On desktop these are
+                visible directly in the header so the Sheet is hidden. */}
+            <Sheet open={mobileMenuOpen} onOpenChange={setMobileMenuOpen}>
+              <SheetTrigger asChild>
+                <Button
+                  variant="outline"
+                  size="icon"
+                  className="sm:hidden relative"
+                  title="More actions"
+                >
+                  <MoreVertical className="w-4 h-4" />
+                  {syncing && (
+                    <span className="absolute -top-0.5 -right-0.5 w-2 h-2 rounded-full bg-blue-500 border border-white dark:border-slate-900 animate-pulse" />
+                  )}
+                </Button>
+              </SheetTrigger>
+              <SheetContent side="right" className="w-[85vw] sm:w-96 overflow-y-auto">
+                <SheetHeader>
+                  <SheetTitle>Actions</SheetTitle>
+                </SheetHeader>
+                <div className="px-4 pb-6 space-y-3">
+                  {/* CSV selector on mobile */}
+                  <div className="space-y-1.5">
+                    <Label className="text-xs font-medium">CSV File</Label>
+                    <Select
+                      value={selectedCsv}
+                      onValueChange={(v) => { setSelectedCsv(v); setMobileMenuOpen(false); }}
+                    >
+                      <SelectTrigger className="w-full">
+                        <FileText className="w-4 h-4 mr-2 text-slate-500" />
+                        <SelectValue placeholder="Select CSV" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {csvFiles.length === 0 ? (
+                          <SelectItem value={selectedCsv || "none"} disabled>
+                            No CSVs found
+                          </SelectItem>
+                        ) : (
+                          csvFiles.map((f) => (
+                            <SelectItem key={f.path} value={f.name}>
+                              <span className="font-medium truncate">{f.name}</span>
+                              <span className="ml-2 text-xs text-slate-500">
+                                {(f.size / 1024).toFixed(1)}KB
+                              </span>
+                              {f.isStatusFile && (
+                                <Badge variant="outline" className="ml-2 py-0 px-1.5 text-[10px] border-emerald-300 text-emerald-700 dark:border-emerald-700 dark:text-emerald-300">
+                                  STATUS
+                                </Badge>
+                              )}
+                            </SelectItem>
+                          ))
+                        )}
+                      </SelectContent>
+                    </Select>
+                  </div>
+
+                  {/* Auto-refresh toggle on mobile */}
+                  <div className="flex items-center justify-between gap-2 px-3 py-2.5 rounded-lg bg-slate-100 dark:bg-slate-900 border border-slate-200 dark:border-slate-800">
+                    <Label htmlFor="auto-refresh-mobile" className="text-xs cursor-pointer flex items-center gap-2">
+                      <RefreshCw className="w-3.5 h-3.5" />
+                      Auto-refresh (3s)
+                    </Label>
+                    <Switch
+                      checked={autoRefresh}
+                      onCheckedChange={setAutoRefresh}
+                      id="auto-refresh-mobile"
+                    />
+                  </div>
+
+                  {/* Hidden file input — there's only ONE shared file input
+                      that lives in the desktop section below. Both the
+                      desktop Import CSV button and the mobile Sheet's
+                      Import CSV button trigger the same input via
+                      fileInputRef. We deliberately do NOT declare a
+                      second input here — two inputs with the same ref
+                      would cause one of them to be inaccessible. */}
+
+                  {/* Import CSV */}
+                  <Button
+                    variant="outline"
+                    className="w-full justify-start gap-2"
+                    onClick={() => fileInputRef.current?.click()}
+                    disabled={uploading}
+                  >
+                    {uploading ? (
+                      <Loader2 className="w-4 h-4 animate-spin" />
+                    ) : (
+                      <Upload className="w-4 h-4" />
+                    )}
+                    Import CSV
+                    {uploading && <span className="text-xs text-slate-500">uploading…</span>}
+                  </Button>
+
+                  {/* Sync Subscriptions */}
+                  <Button
+                    variant="outline"
+                    className="w-full justify-start gap-2"
+                    onClick={() => { syncSubscriptions(); setMobileMenuOpen(false); }}
+                    disabled={syncing}
+                  >
+                    {syncing ? (
+                      <Loader2 className="w-4 h-4 animate-spin" />
+                    ) : (
+                      <RefreshCw className="w-4 h-4" />
+                    )}
+                    Sync Subscriptions
+                  </Button>
+
+                  {/* Find Similar — opens a separate page */}
+                  <Button
+                    variant="outline"
+                    className="w-full justify-start gap-2"
+                    onClick={() => {
+                      setMobileMenuOpen(false);
+                      router.push(`/find-similar${selectedCsv ? `?csv=${encodeURIComponent(selectedCsv)}` : ""}`);
+                    }}
+                  >
+                    <Search className="w-4 h-4" />
+                    Find Similar Subreddits
+                  </Button>
+
+                  {/* Debug */}
+                  <Button
+                    variant="outline"
+                    className={cn(
+                      "w-full justify-start gap-2",
+                      showDebug && "bg-orange-100 dark:bg-orange-900/30 border-orange-300 dark:border-orange-700"
+                    )}
+                    onClick={() => {
+                      setShowDebug(!showDebug);
+                      if (!showDebug) fetchDebugInfo();
+                      setMobileMenuOpen(false);
+                    }}
+                  >
+                    <Bug className="w-4 h-4" />
+                    {showDebug ? "Hide Debug" : "Show Debug"}
+                  </Button>
+
+                  <SheetClose asChild>
+                    <Button variant="ghost" className="w-full">
+                      Close
+                    </Button>
+                  </SheetClose>
+                </div>
+              </SheetContent>
+            </Sheet>
+
+            {/* Desktop-only buttons (hidden on mobile, where they
+                live inside the Sheet menu above). */}
+            {/* Single shared hidden file input — used by both the
+                desktop Import CSV button and the mobile Sheet's
+                Import CSV button. */}
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept=".csv,.status.csv"
+              className="hidden"
+              onChange={(e) => {
+                const file = e.target.files?.[0];
+                if (file) handleFileUpload(file);
+                e.target.value = "";
+                setMobileMenuOpen(false);
+              }}
+            />
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => fileInputRef.current?.click()}
+              disabled={uploading}
+              title="Upload a CSV file from this device to the Pi"
+              className="gap-1.5 hidden sm:flex"
+            >
+              {uploading ? (
+                <Loader2 className="w-4 h-4 animate-spin" />
+              ) : (
+                <Upload className="w-4 h-4" />
+              )}
+              <span>Import CSV</span>
+            </Button>
+
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={syncSubscriptions}
+              disabled={syncing}
+              title="Fetch your live subscribed subreddits from Reddit and add any missing ones to the CSV"
+              className="gap-1.5 hidden sm:flex"
+            >
+              {syncing ? (
+                <Loader2 className="w-4 h-4 animate-spin" />
+              ) : (
+                <RefreshCw className="w-4 h-4" />
+              )}
+              <span>Sync</span>
+            </Button>
+
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => {
+                router.push(`/find-similar${selectedCsv ? `?csv=${encodeURIComponent(selectedCsv)}` : ""}`);
+              }}
+              title="Find similar subreddits to banned ones"
+              className="gap-1.5 hidden sm:flex"
+            >
+              <Search className="w-4 h-4" />
+              <span>Find Similar</span>
+            </Button>
+
             <Button
               variant="outline"
               size="icon"
@@ -859,15 +988,15 @@ export default function Home() {
                 if (!showDebug) fetchDebugInfo();
               }}
               title="Toggle debug panel"
-              className={cn(showDebug && "bg-orange-100 dark:bg-orange-900/30 border-orange-300 dark:border-orange-700")}
+              className={cn("hidden sm:flex", showDebug && "bg-orange-100 dark:bg-orange-900/30 border-orange-300 dark:border-orange-700")}
             >
               <Bug className="w-4 h-4" />
             </Button>
           </div>
         </div>
 
-        {/* Last fetch indicator */}
-        <div className="container mx-auto px-4 pb-2 flex items-center gap-2 text-xs text-slate-500">
+        {/* Last fetch indicator — hidden on mobile to save vertical space */}
+        <div className="container mx-auto px-4 pb-2 hidden sm:flex items-center gap-2 text-xs text-slate-500">
           {lastFetch && (
             <>
               <span>Last updated {formatRelativeTime(lastFetch.toISOString())}</span>
@@ -1559,17 +1688,28 @@ export default function Home() {
               variant="outline"
               size="sm"
               onClick={() => {
-                // Export only banned rows as a CSV file
+                // Export only banned rows as a CSV file.
+                // Subreddit names technically can't contain commas/quotes,
+                // but we escape defensively anyway so the export round-trips
+                // cleanly through any CSV reader (Excel, Numbers, etc.).
                 const subCol = csvData.subCol || "subreddit";
                 const bannedRows = csvData.rows.filter(
                   (r) => (r.status || "").trim().toLowerCase() === "banned"
                 );
                 if (bannedRows.length === 0) return;
-                // Build CSV: just the subreddit name column + status
-                const lines = [`${subCol},status`];
+                // Proper CSV escaping: wrap in quotes if the field contains
+                // a comma, double-quote, or newline; double any embedded quotes.
+                const escapeCsv = (v: string) => {
+                  if (!v) return "";
+                  if (v.includes(",") || v.includes('"') || v.includes("\n")) {
+                    return `"${v.replace(/"/g, '""')}"`;
+                  }
+                  return v;
+                };
+                const lines = [`${escapeCsv(subCol)},status`];
                 for (const row of bannedRows) {
-                  const name = (row[subCol] || "").replace(/,/g, "");
-                  lines.push(`${name},banned`);
+                  const name = row[subCol] || "";
+                  lines.push(`${escapeCsv(name)},banned`);
                 }
                 const csv = lines.join("\n");
                 const blob = new Blob([csv], { type: "text/csv" });
@@ -1589,257 +1729,71 @@ export default function Home() {
           )}
         </div>
 
-        {/* Find Similar panel */}
-        {showFindSimilar && (
-          <Card className="border-blue-200 dark:border-blue-800 bg-blue-50/50 dark:bg-blue-950/20">
-            <CardHeader className="border-b border-slate-200 dark:border-slate-800 py-3">
-              <CardTitle className="text-base flex items-center gap-2">
-                <Search className="w-4 h-4" />
-                Find Similar Subreddits
-                {similarFor && (
-                  <span className="text-sm text-slate-500 font-normal ml-2">
-                    for r/{similarFor}
-                  </span>
+        {/* Sync result banner — moved out of the (now removed) inline
+            Find Similar panel. Shows the result of the Sync Subscriptions
+            button so the user gets feedback after clicking it. */}
+        {syncResult && (
+          <Card className={cn(
+            "border",
+            syncResult.error
+              ? "border-red-200 dark:border-red-800 bg-red-50/50 dark:bg-red-950/20"
+              : "border-emerald-200 dark:border-emerald-800 bg-emerald-50/50 dark:bg-emerald-950/20"
+          )}>
+            <CardContent className="pt-4 pb-4">
+              <div className="flex items-start gap-3">
+                {syncResult.error ? (
+                  <AlertCircle className="w-5 h-5 text-red-600 dark:text-red-400 flex-shrink-0 mt-0.5" />
+                ) : (
+                  <CheckCircle2 className="w-5 h-5 text-emerald-600 dark:text-emerald-400 flex-shrink-0 mt-0.5" />
                 )}
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  onClick={() => setShowFindSimilar(false)}
-                  className="ml-auto"
-                >
-                  Close
-                </Button>
-              </CardTitle>
-            </CardHeader>
-            <CardContent className="pt-4 space-y-3">
-              {/* Manual subreddit input — search any subreddit */}
-              <div className="flex gap-2">
-                <Input
-                  placeholder="Enter any subreddit name (e.g. animepanties)..."
-                  value={similarInput}
-                  onChange={(e) => setSimilarInput(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter" && similarInput.trim()) {
-                      findSimilar(similarInput.trim());
-                    }
-                  }}
-                  className="flex-1"
-                />
-                <Button
-                  size="sm"
-                  onClick={() => similarInput.trim() && findSimilar(similarInput.trim())}
-                  disabled={similarLoading || !similarInput.trim()}
-                >
-                  {similarLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Search className="w-4 h-4" />}
-                  Search
-                </Button>
-              </div>
-
-              {/* Sync result display */}
-              {syncResult && (
-                <div className={cn(
-                  "p-3 rounded-lg text-sm border",
-                  syncResult.error
-                    ? "bg-red-50 dark:bg-red-950/30 border-red-200 dark:border-red-800 text-red-700 dark:text-red-300"
-                    : "bg-emerald-50 dark:bg-emerald-950/30 border-emerald-200 dark:border-emerald-800 text-emerald-700 dark:text-emerald-300"
-                )}>
+                <div className="flex-1 min-w-0">
                   {syncResult.error ? (
-                    <p>Sync failed: {syncResult.error}</p>
+                    <>
+                      <p className="font-semibold text-red-700 dark:text-red-300">Sync failed</p>
+                      <p className="text-sm text-red-600 dark:text-red-400 mt-1 break-words">
+                        {syncResult.error}
+                      </p>
+                    </>
                   ) : (
-                    <div>
-                      <p className="font-medium">{syncResult.message}</p>
+                    <>
+                      <p className="font-semibold text-emerald-700 dark:text-emerald-300">
+                        Sync complete
+                      </p>
+                      <p className="text-sm text-emerald-700 dark:text-emerald-400 mt-1">
+                        {syncResult.message}
+                      </p>
                       {syncResult.total_live > 0 && (
-                        <p className="text-xs mt-1">
+                        <p className="text-xs text-slate-500 mt-1">
                           Live subscriptions on Reddit: {syncResult.total_live}
                         </p>
                       )}
                       {syncResult.added_names && syncResult.added_names.length > 0 && (
-                        <p className="text-xs mt-1">
+                        <p className="text-xs text-slate-500 mt-1">
                           Added: {syncResult.added_names.join(", ")}
                           {syncResult.added > 10 && ` ...and ${syncResult.added - 10} more`}
                         </p>
                       )}
-                    </div>
+                      {syncResult.warning && (
+                        <p className="text-xs text-amber-600 dark:text-amber-400 mt-1">
+                          ⚠ {syncResult.warning}
+                        </p>
+                      )}
+                    </>
                   )}
                 </div>
-              )}
-
-              {/* Keywords */}
-              {similarKeywords.length > 0 && (
-                <div className="flex items-center gap-2 flex-wrap">
-                  <span className="text-xs text-slate-500">Keywords:</span>
-                  {similarKeywords.map((kw) => (
-                    <Badge key={kw} variant="outline" className="text-[10px] py-0 px-1.5">
-                      {kw}
-                    </Badge>
-                  ))}
-                </div>
-              )}
-
-              {/* Loading */}
-              {similarLoading && (
-                <div className="flex items-center gap-2 text-sm text-slate-500 py-8 justify-center">
-                  <Loader2 className="w-5 h-5 animate-spin" />
-                  Searching Reddit for similar subreddits...
-                </div>
-              )}
-
-              {/* Error */}
-              {similarError && (
-                <div className="p-3 rounded-lg bg-red-50 dark:bg-red-950/30 border border-red-200 dark:border-red-800 text-red-700 dark:text-red-300 text-sm">
-                  {similarError}
-                </div>
-              )}
-
-              {/* Results */}
-              {!similarLoading && !similarError && similarResults.length > 0 && (
-                <>
-                  {/* Filters */}
-                  <div className="flex flex-wrap gap-2 items-center">
-                    <Select value={similarSort} onValueChange={(v) => setSimilarSort(v as "relevance" | "subscribers")}>
-                      <SelectTrigger className="w-[130px] h-8">
-                        <SelectValue placeholder="Sort by" />
-                      </SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value="relevance">Relevance</SelectItem>
-                        <SelectItem value="subscribers">Subscribers</SelectItem>
-                      </SelectContent>
-                    </Select>
-                    <Select value={similarNsfwFilter} onValueChange={(v) => setSimilarNsfwFilter(v as any)}>
-                      <SelectTrigger className="w-[120px] h-8">
-                        <SelectValue placeholder="Content" />
-                      </SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value="all">All content</SelectItem>
-                        <SelectItem value="sfw">SFW only</SelectItem>
-                        <SelectItem value="nsfw">NSFW only</SelectItem>
-                      </SelectContent>
-                    </Select>
-                    <div className="flex items-center gap-1.5">
-                      <Label className="text-xs">Min subs:</Label>
-                      <Input
-                        type="number"
-                        value={similarMinSubs}
-                        onChange={(e) => setSimilarMinSubs(parseInt(e.target.value) || 0)}
-                        className="w-20 h-8 text-xs"
-                      />
-                    </div>
-                    <span className="text-xs text-slate-500 ml-auto">
-                      {(() => {
-                        const filtered = similarResults.filter((r) => {
-                          if (similarNsfwFilter === "sfw" && r.is_nsfw) return false;
-                          if (similarNsfwFilter === "nsfw" && !r.is_nsfw) return false;
-                          if (r.subscribers < similarMinSubs) return false;
-                          return true;
-                        });
-                        return `${filtered.length} results`;
-                      })()}
-                    </span>
-                  </div>
-
-                  {/* Results list */}
-                  <div className="space-y-2 max-h-[400px] overflow-auto">
-                    {(() => {
-                      let filtered = similarResults.filter((r) => {
-                        if (similarNsfwFilter === "sfw" && r.is_nsfw) return false;
-                        if (similarNsfwFilter === "nsfw" && !r.is_nsfw) return false;
-                        if (r.subscribers < similarMinSubs) return false;
-                        return true;
-                      });
-                      filtered.sort((a, b) => {
-                        if (similarSort === "subscribers") return b.subscribers - a.subscribers;
-                        return b.relevance_score - a.relevance_score;
-                      });
-                      return filtered.map((r) => (
-                        <div
-                          key={r.name}
-                          className="flex items-center gap-3 p-2.5 rounded-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 hover:border-blue-300 dark:hover:border-blue-700"
-                        >
-                          <div className="flex-1 min-w-0">
-                            <div className="flex items-center gap-2">
-                              <a
-                                href={r.url}
-                                target="_blank"
-                                rel="noopener noreferrer"
-                                className="font-semibold text-slate-900 dark:text-slate-100 hover:text-blue-600 dark:hover:text-blue-400 text-sm"
-                              >
-                                r/{r.name}
-                              </a>
-                              {r.is_nsfw && (
-                                <Badge variant="outline" className="text-[10px] py-0 px-1.5 border-rose-300 text-rose-700 dark:border-rose-700 dark:text-rose-300">
-                                  NSFW
-                                </Badge>
-                              )}
-                              {r.already_in_csv && (
-                                <Badge variant="outline" className="text-[10px] py-0 px-1.5 border-emerald-300 text-emerald-700 dark:border-emerald-700 dark:text-emerald-300">
-                                  In CSV
-                                </Badge>
-                              )}
-                            </div>
-                            <p className="text-xs text-slate-500 dark:text-slate-400 line-clamp-1 mt-0.5">
-                              {r.description || r.display_name || "—"}
-                            </p>
-                          </div>
-                          <div className="flex items-center gap-3 flex-shrink-0">
-                            <div className="text-right">
-                              <p className="text-xs font-mono text-slate-700 dark:text-slate-300">
-                                {formatNumber(String(r.subscribers))}
-                              </p>
-                              <p className="text-[10px] text-slate-500">subs</p>
-                            </div>
-                            <div className="text-right">
-                              <p className="text-xs font-mono text-blue-600 dark:text-blue-400">
-                                {r.relevance_score}
-                              </p>
-                              <p className="text-[10px] text-slate-500">match</p>
-                            </div>
-                            <Button
-                              size="sm"
-                              variant="outline"
-                              className="h-7 text-xs"
-                              onClick={async () => {
-                                // Add this subreddit to the CSV as "pending"
-                                try {
-                                  await fetch("/api/csv-add-row", {
-                                    method: "POST",
-                                    headers: { "Content-Type": "application/json" },
-                                    body: JSON.stringify({
-                                      csv: selectedCsv,
-                                      subreddit: r.name,
-                                      status: "pending",
-                                    }),
-                                  });
-                                  // Mark as added in the UI
-                                  setSimilarResults((prev) =>
-                                    prev.map((s) =>
-                                      s.name === r.name ? { ...s, already_in_csv: true } : s
-                                    )
-                                  );
-                                  fetchCsvData(selectedCsv);
-                                } catch {}
-                              }}
-                              disabled={r.already_in_csv}
-                              title="Add to CSV as pending"
-                            >
-                              {r.already_in_csv ? "Added" : "Add"}
-                            </Button>
-                          </div>
-                        </div>
-                      ));
-                    })()}
-                  </div>
-                </>
-              )}
-
-              {/* No results */}
-              {!similarLoading && !similarError && similarResults.length === 0 && similarFor && (
-                <div className="text-center py-8 text-slate-500 text-sm">
-                  No similar subreddits found. Try a different banned subreddit.
-                </div>
-              )}
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => setSyncResult(null)}
+                  className="text-slate-500"
+                >
+                  Dismiss
+                </Button>
+              </div>
             </CardContent>
           </Card>
         )}
+
 
         {/* Subreddit table */}
         <Card className="flex-1 flex flex-col min-h-[400px]">
@@ -2007,13 +1961,21 @@ export default function Home() {
                                       <SelectItem value="not_found">Not Found</SelectItem>
                                     </SelectContent>
                                   </Select>
-                                  {/* Find Similar button — only for banned/not_found rows */}
+                                  {/* Find Similar button — only for banned/not_found rows.
+                                      Navigates to the standalone /find-similar page
+                                      pre-filled with this subreddit's name. */}
                                   {(status === "banned" || status === "not_found") && (
                                     <Button
                                       variant="ghost"
                                       size="sm"
                                       className="h-6 w-7 p-0 hover:bg-blue-100 dark:hover:bg-blue-900/30"
-                                      onClick={() => findSimilar(name)}
+                                      onClick={() => {
+                                        router.push(
+                                          `/find-similar?sub=${encodeURIComponent(name)}${
+                                            selectedCsv ? `&csv=${encodeURIComponent(selectedCsv)}` : ""
+                                          }`
+                                        );
+                                      }}
                                       title="Find similar unbanned subreddits"
                                     >
                                       <Search className="w-3 h-3 text-blue-500 group-hover:text-blue-600 dark:group-hover:text-blue-400" />
@@ -2162,7 +2124,13 @@ function RunControls({
   const [logLines, setLogLines] = useState<
     { timestamp: string; stream: "stdout" | "stderr"; text: string }[]
   >([]);
-  const [lastLogIdx, setLastLogIdx] = useState(0);
+  // MAX_LOG_LINES_CLIENT — cap the number of log lines we render in the
+  // terminal. Without this, a long-running subscriber pass would push
+  // thousands of lines into React state, and the terminal would get
+  // noticeably laggy (each refresh re-renders ALL the lines).
+  // 1000 lines is ~50KB of text — enough context to scroll back through
+  // recent activity without slowing down the UI.
+  const MAX_LOG_LINES_CLIENT = 1000;
   const [starting, setStarting] = useState(false);
   const [stopping, setStopping] = useState(false);
   const [continuing, setContinuing] = useState(false);
@@ -2243,11 +2211,18 @@ function RunControls({
 
         setRunStatus(data);
 
-        // Append new log lines
+        // Append new log lines (capped at MAX_LOG_LINES_CLIENT to keep
+        // the UI responsive on long runs — otherwise rendering thousands
+        // of <div>s every poll cycle makes the terminal janky).
         if (data.logs && data.logs.length > 0) {
-          setLogLines((prev) => [...prev, ...data.logs]);
+          setLogLines((prev) => {
+            const combined = [...prev, ...data.logs];
+            if (combined.length > MAX_LOG_LINES_CLIENT) {
+              return combined.slice(-MAX_LOG_LINES_CLIENT);
+            }
+            return combined;
+          });
           lastLogIdxRef.current = data.totalLogLines;
-          setLastLogIdx(data.totalLogLines);
         }
 
         // When the run completes or errors, refresh the CSV data
@@ -2291,7 +2266,16 @@ function RunControls({
       clearInterval(interval);
       document.removeEventListener("visibilitychange", handleVisibility);
     };
-  }, [lastLogIdx, runStatus?.status]);
+    // NOTE: this effect intentionally does NOT depend on lastLogIdx.
+    // lastLogIdx is stored in a ref (lastLogIdxRef.current) so the
+    // polling function always reads the latest value without needing
+    // the effect to be torn down and recreated on every poll cycle.
+    // Including lastLogIdx in the deps array (as before) caused the
+    // effect to be recreated every time logs arrived, which cleared
+    // and recreated the interval constantly — wasteful and a source
+    // of subtle timing bugs. We only want to recreate the effect when
+    // the polling cadence needs to change (running vs idle).
+  }, [runStatus?.status, onCsvDataRefresh]);
 
   // Auto-scroll to bottom of log terminal
   useEffect(() => {
@@ -2308,7 +2292,6 @@ function RunControls({
       totalLogLines: 0, scriptPath: "", csvRoot: "", pythonCmd: "", platform: "",
     });
     setLogLines([]);
-    setLastLogIdx(0);
     lastLogIdxRef.current = 0;
     try {
       const res = await fetch("/api/run", {
@@ -2625,7 +2608,6 @@ function RunControls({
             size="sm"
             onClick={() => {
               setLogLines([]);
-              setLastLogIdx(0);
               lastLogIdxRef.current = 0;
             }}
           >

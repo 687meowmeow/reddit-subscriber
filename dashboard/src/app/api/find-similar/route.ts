@@ -41,7 +41,10 @@ async function getCsvRoot(): Promise<string> {
   return path.resolve(process.cwd(), "..");
 }
 
-// Fetch JSON from Reddit with proper User-Agent
+// Fetch JSON from Reddit with proper User-Agent.
+// Detects HTML responses (login page / rate-limit page) and throws a
+// clear error instead of letting `res.json()` fail with a confusing
+// "Unexpected token <" message.
 async function fetchRedditJson(url: string): Promise<any> {
   const res = await fetch(url, {
     headers: {
@@ -54,7 +57,26 @@ async function fetchRedditJson(url: string): Promise<any> {
   if (!res.ok) {
     throw new Error(`HTTP ${res.status}: ${url}`);
   }
-  return res.json();
+  // Read the body as text first, then check it actually looks like JSON.
+  // Reddit serves HTML for some endpoints when:
+  //   - rate-limited ("Whoa there, pardner!" page)
+  //   - not logged in (login redirect)
+  //   - subreddit is banned/private
+  // In those cases the body starts with "<!DOCTYPE html>" or "<html".
+  const text = await res.text();
+  const stripped = text.replace(/^\s+/, "");
+  if (!stripped.startsWith("{") && !stripped.startsWith("[")) {
+    // Extract a short snippet for the error message
+    const snippet = stripped.replace(/\s+/g, " ").slice(0, 120);
+    throw new Error(
+      `Reddit returned HTML instead of JSON (probably rate-limited or login page). Snippet: "${snippet}"`
+    );
+  }
+  try {
+    return JSON.parse(text);
+  } catch (err) {
+    throw new Error(`Failed to parse Reddit JSON: ${err instanceof Error ? err.message : String(err)}`);
+  }
 }
 
 // Extract keywords from a subreddit name + description
@@ -160,6 +182,19 @@ export async function POST(request: NextRequest) {
     // Strip r/ prefix
     const cleanName = subredditName.replace(/^r\//i, "").replace(/^\/r\//i, "");
 
+    // Reject user profiles — Find Similar searches /subreddits/search.json
+    // which is subreddit-only. Trying to fetch /r/u_NAME/about.json would
+    // 404 and the keyword extraction would fall back to the bare name,
+    // giving useless results.
+    if (cleanName.toLowerCase().startsWith("u_") || cleanName.toLowerCase().startsWith("u/")) {
+      return NextResponse.json(
+        {
+          error: `"${cleanName}" looks like a user profile (u_ prefix). Find Similar only works for subreddits, not user accounts.`,
+        },
+        { status: 400 }
+      );
+    }
+
     const csvRoot = await getCsvRoot();
 
     // Step 1: Fetch the banned subreddit's about.json
@@ -176,7 +211,9 @@ export async function POST(request: NextRequest) {
         displayName = data.display_name || cleanName;
       }
     } catch {
-      // If we can't fetch about.json, proceed with just the name
+      // If we can't fetch about.json, proceed with just the name.
+      // This happens for banned subs that don't return about.json —
+      // we'll just extract keywords from the name itself.
     }
 
     // Step 2: Extract keywords

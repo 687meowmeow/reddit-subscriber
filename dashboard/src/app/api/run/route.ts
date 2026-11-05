@@ -49,20 +49,36 @@ function startXvfb(): string | null {
   // or VNC server. The user won't see the browser window, but it won't
   // be headless (which would increase shadowban risk).
   try {
-    // Kill any existing Xvfb on :99
+    // Kill any existing Xvfb on :99 (so we don't get "display already in use")
     try {
       execSync("pkill -f 'Xvfb :99'", { stdio: "ignore", timeout: 2000 });
     } catch {}
-    // Start Xvfb with a reasonable resolution
+    // Start Xvfb in the background. The `&` makes execSync return
+    // immediately after spawning — Xvfb keeps running.
     execSync(
-      "Xvfb :99 -screen 0 1920x1080x24 -ac &",
-      { stdio: "ignore", timeout: 5000, detached: true }
+      "Xvfb :99 -screen 0 1920x1080x24 -ac +extension RANDR >/dev/null 2>&1 &",
+      { stdio: "ignore", timeout: 5000 }
     );
-    // Wait a moment for it to start
-    setTimeout(() => {}, 1000);
-    // Verify it's running
-    if (xServerReachable(":99")) {
-      return ":99";
+    // IMPORTANT — wait for Xvfb to actually be ready before checking.
+    // The previous code used `setTimeout(() => {}, 1000)` which is a
+    // no-op — setTimeout does NOT block; it just schedules a callback
+    // and returns immediately. So `xServerReachable(":99")` was running
+    // before Xvfb was ready, causing the function to return null and
+    // fall back to headless mode (which increases shadowban risk).
+    //
+    // Use execSync('sleep 1') to actually block for 1 second.
+    try {
+      execSync("sleep 1", { stdio: "ignore", timeout: 3000 });
+    } catch {}
+    // Poll for up to 3 more seconds (in 200ms increments) for Xvfb to
+    // become reachable. This handles slow Pi startup where 1s isn't enough.
+    for (let attempt = 0; attempt < 15; attempt++) {
+      if (xServerReachable(":99")) {
+        return ":99";
+      }
+      try {
+        execSync("sleep 0.2", { stdio: "ignore", timeout: 1000 });
+      } catch {}
     }
     return null;
   } catch {
@@ -292,14 +308,19 @@ export async function POST(request: NextRequest) {
     runState.status = "running";
 
     try {
+      // spawn()'s overload resolution sometimes picks the wrong overload
+      // when env is typed as Record<string, string> — cast to ProcessEnv
+      // to disambiguate. Also cast the result to ChildProcess so TS
+      // doesn't reduce the union to `never` (which was causing the
+      // pid/stdout/stderr/on property accesses to fail typecheck).
       const child = spawn(pyCmd, args, {
         cwd: csvRoot,
         stdio: ["pipe", "pipe", "pipe"],
-        env: childEnv,
-      });
+        env: childEnv as NodeJS.ProcessEnv,
+      }) as import("child_process").ChildProcess;
 
       runState.process = child;
-      runState.pid = child.pid;
+      runState.pid = child.pid ?? null;
 
       child.stdout?.on("data", (data: Buffer) => {
         const text = data.toString("utf-8");

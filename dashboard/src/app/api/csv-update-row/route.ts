@@ -185,6 +185,7 @@ export async function POST(request: NextRequest) {
     }
 
     // Update the status
+    const oldStatus = rows[foundIdx][statusColIdx] || "pending";
     rows[foundIdx][statusColIdx] = newStatus;
 
     // Update the error column if provided and exists
@@ -207,7 +208,7 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({
       ok: true,
       subreddit: subredditName,
-      oldStatus: "updated",
+      oldStatus: oldStatus,
       newStatus: newStatus,
     });
   } catch (err) {
