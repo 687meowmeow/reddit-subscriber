@@ -245,6 +245,18 @@ export default function Home() {
   const [debouncedSearch, setDebouncedSearch] = useState<string>("");
   const searchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
+  // Find Similar feature state
+  const [showFindSimilar, setShowFindSimilar] = useState<boolean>(false);
+  const [similarLoading, setSimilarLoading] = useState<boolean>(false);
+  const [similarResults, setSimilarResults] = useState<any[]>([]);
+  const [similarFor, setSimilarFor] = useState<string>("");
+  const [similarKeywords, setSimilarKeywords] = useState<string[]>([]);
+  const [similarError, setSimilarError] = useState<string | null>(null);
+  // Filter state for similar results
+  const [similarSort, setSimilarSort] = useState<"relevance" | "subscribers">("relevance");
+  const [similarNsfwFilter, setSimilarNsfwFilter] = useState<"all" | "sfw" | "nsfw">("all");
+  const [similarMinSubs, setSimilarMinSubs] = useState<number>(0);
+
   // Settings state
   const [showSettings, setShowSettings] = useState<boolean>(false);
   const [settings, setSettings] = useState<{ csvRoot: string; pythonCmd: string; githubRepo?: string; githubPat?: string; autoUpdate?: boolean }>({ csvRoot: "", pythonCmd: "" });
@@ -440,6 +452,34 @@ export default function Home() {
   }, []);
 
   // Handle CSV file upload (import from another device)
+  // Find similar subreddits for a given (banned) subreddit
+  const findSimilar = useCallback(async (subredditName: string) => {
+    setShowFindSimilar(true);
+    setSimilarLoading(true);
+    setSimilarError(null);
+    setSimilarResults([]);
+    setSimilarFor(subredditName);
+    setSimilarKeywords([]);
+    try {
+      const res = await fetch("/api/find-similar", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ subreddit: subredditName }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setSimilarError(data.error || `HTTP ${res.status}`);
+      } else {
+        setSimilarResults(data.results || []);
+        setSimilarKeywords(data.keywords || []);
+      }
+    } catch (err) {
+      setSimilarError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setSimilarLoading(false);
+    }
+  }, []);
+
   const handleFileUpload = useCallback(async (file: File) => {
     setUploading(true);
     setUploadResult(null);
@@ -1446,6 +1486,206 @@ export default function Home() {
           )}
         </div>
 
+        {/* Find Similar panel */}
+        {showFindSimilar && (
+          <Card className="border-blue-200 dark:border-blue-800 bg-blue-50/50 dark:bg-blue-950/20">
+            <CardHeader className="border-b border-slate-200 dark:border-slate-800 py-3">
+              <CardTitle className="text-base flex items-center gap-2">
+                <Search className="w-4 h-4" />
+                Find Similar Subreddits
+                {similarFor && (
+                  <span className="text-sm text-slate-500 font-normal ml-2">
+                    for r/{similarFor}
+                  </span>
+                )}
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => setShowFindSimilar(false)}
+                  className="ml-auto"
+                >
+                  Close
+                </Button>
+              </CardTitle>
+            </CardHeader>
+            <CardContent className="pt-4 space-y-3">
+              {/* Keywords */}
+              {similarKeywords.length > 0 && (
+                <div className="flex items-center gap-2 flex-wrap">
+                  <span className="text-xs text-slate-500">Keywords:</span>
+                  {similarKeywords.map((kw) => (
+                    <Badge key={kw} variant="outline" className="text-[10px] py-0 px-1.5">
+                      {kw}
+                    </Badge>
+                  ))}
+                </div>
+              )}
+
+              {/* Loading */}
+              {similarLoading && (
+                <div className="flex items-center gap-2 text-sm text-slate-500 py-8 justify-center">
+                  <Loader2 className="w-5 h-5 animate-spin" />
+                  Searching Reddit for similar subreddits...
+                </div>
+              )}
+
+              {/* Error */}
+              {similarError && (
+                <div className="p-3 rounded-lg bg-red-50 dark:bg-red-950/30 border border-red-200 dark:border-red-800 text-red-700 dark:text-red-300 text-sm">
+                  {similarError}
+                </div>
+              )}
+
+              {/* Results */}
+              {!similarLoading && !similarError && similarResults.length > 0 && (
+                <>
+                  {/* Filters */}
+                  <div className="flex flex-wrap gap-2 items-center">
+                    <Select value={similarSort} onValueChange={(v) => setSimilarSort(v as "relevance" | "subscribers")}>
+                      <SelectTrigger className="w-[130px] h-8">
+                        <SelectValue placeholder="Sort by" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="relevance">Relevance</SelectItem>
+                        <SelectItem value="subscribers">Subscribers</SelectItem>
+                      </SelectContent>
+                    </Select>
+                    <Select value={similarNsfwFilter} onValueChange={(v) => setSimilarNsfwFilter(v as any)}>
+                      <SelectTrigger className="w-[120px] h-8">
+                        <SelectValue placeholder="Content" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="all">All content</SelectItem>
+                        <SelectItem value="sfw">SFW only</SelectItem>
+                        <SelectItem value="nsfw">NSFW only</SelectItem>
+                      </SelectContent>
+                    </Select>
+                    <div className="flex items-center gap-1.5">
+                      <Label className="text-xs">Min subs:</Label>
+                      <Input
+                        type="number"
+                        value={similarMinSubs}
+                        onChange={(e) => setSimilarMinSubs(parseInt(e.target.value) || 0)}
+                        className="w-20 h-8 text-xs"
+                      />
+                    </div>
+                    <span className="text-xs text-slate-500 ml-auto">
+                      {(() => {
+                        const filtered = similarResults.filter((r) => {
+                          if (similarNsfwFilter === "sfw" && r.is_nsfw) return false;
+                          if (similarNsfwFilter === "nsfw" && !r.is_nsfw) return false;
+                          if (r.subscribers < similarMinSubs) return false;
+                          return true;
+                        });
+                        return `${filtered.length} results`;
+                      })()}
+                    </span>
+                  </div>
+
+                  {/* Results list */}
+                  <div className="space-y-2 max-h-[400px] overflow-auto">
+                    {(() => {
+                      let filtered = similarResults.filter((r) => {
+                        if (similarNsfwFilter === "sfw" && r.is_nsfw) return false;
+                        if (similarNsfwFilter === "nsfw" && !r.is_nsfw) return false;
+                        if (r.subscribers < similarMinSubs) return false;
+                        return true;
+                      });
+                      filtered.sort((a, b) => {
+                        if (similarSort === "subscribers") return b.subscribers - a.subscribers;
+                        return b.relevance_score - a.relevance_score;
+                      });
+                      return filtered.map((r) => (
+                        <div
+                          key={r.name}
+                          className="flex items-center gap-3 p-2.5 rounded-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 hover:border-blue-300 dark:hover:border-blue-700"
+                        >
+                          <div className="flex-1 min-w-0">
+                            <div className="flex items-center gap-2">
+                              <a
+                                href={r.url}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="font-semibold text-slate-900 dark:text-slate-100 hover:text-blue-600 dark:hover:text-blue-400 text-sm"
+                              >
+                                r/{r.name}
+                              </a>
+                              {r.is_nsfw && (
+                                <Badge variant="outline" className="text-[10px] py-0 px-1.5 border-rose-300 text-rose-700 dark:border-rose-700 dark:text-rose-300">
+                                  NSFW
+                                </Badge>
+                              )}
+                              {r.already_in_csv && (
+                                <Badge variant="outline" className="text-[10px] py-0 px-1.5 border-emerald-300 text-emerald-700 dark:border-emerald-700 dark:text-emerald-300">
+                                  In CSV
+                                </Badge>
+                              )}
+                            </div>
+                            <p className="text-xs text-slate-500 dark:text-slate-400 line-clamp-1 mt-0.5">
+                              {r.description || r.display_name || "—"}
+                            </p>
+                          </div>
+                          <div className="flex items-center gap-3 flex-shrink-0">
+                            <div className="text-right">
+                              <p className="text-xs font-mono text-slate-700 dark:text-slate-300">
+                                {formatNumber(String(r.subscribers))}
+                              </p>
+                              <p className="text-[10px] text-slate-500">subs</p>
+                            </div>
+                            <div className="text-right">
+                              <p className="text-xs font-mono text-blue-600 dark:text-blue-400">
+                                {r.relevance_score}
+                              </p>
+                              <p className="text-[10px] text-slate-500">match</p>
+                            </div>
+                            <Button
+                              size="sm"
+                              variant="outline"
+                              className="h-7 text-xs"
+                              onClick={async () => {
+                                // Add this subreddit to the CSV as "pending"
+                                try {
+                                  await fetch("/api/csv-add-row", {
+                                    method: "POST",
+                                    headers: { "Content-Type": "application/json" },
+                                    body: JSON.stringify({
+                                      csv: selectedCsv,
+                                      subreddit: r.name,
+                                      status: "pending",
+                                    }),
+                                  });
+                                  // Mark as added in the UI
+                                  setSimilarResults((prev) =>
+                                    prev.map((s) =>
+                                      s.name === r.name ? { ...s, already_in_csv: true } : s
+                                    )
+                                  );
+                                  fetchCsvData(selectedCsv);
+                                } catch {}
+                              }}
+                              disabled={r.already_in_csv}
+                              title="Add to CSV as pending"
+                            >
+                              {r.already_in_csv ? "Added" : "Add"}
+                            </Button>
+                          </div>
+                        </div>
+                      ));
+                    })()}
+                  </div>
+                </>
+              )}
+
+              {/* No results */}
+              {!similarLoading && !similarError && similarResults.length === 0 && similarFor && (
+                <div className="text-center py-8 text-slate-500 text-sm">
+                  No similar subreddits found. Try a different banned subreddit.
+                </div>
+              )}
+            </CardContent>
+          </Card>
+        )}
+
         {/* Subreddit table */}
         <Card className="flex-1 flex flex-col min-h-[400px]">
           <CardHeader className="border-b border-slate-200 dark:border-slate-800 py-3">
@@ -1612,6 +1852,18 @@ export default function Home() {
                                       <SelectItem value="not_found">Not Found</SelectItem>
                                     </SelectContent>
                                   </Select>
+                                  {/* Find Similar button — only for banned/not_found rows */}
+                                  {(status === "banned" || status === "not_found") && (
+                                    <Button
+                                      variant="ghost"
+                                      size="sm"
+                                      className="h-6 w-7 p-0 hover:bg-blue-100 dark:hover:bg-blue-900/30"
+                                      onClick={() => findSimilar(name)}
+                                      title="Find similar unbanned subreddits"
+                                    >
+                                      <Search className="w-3 h-3 text-blue-500 group-hover:text-blue-600 dark:group-hover:text-blue-400" />
+                                    </Button>
+                                  )}
                                 </div>
                               </td>
 
