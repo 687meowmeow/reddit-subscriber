@@ -34,8 +34,6 @@ import argparse
 import json
 import os
 import re
-import shutil
-import subprocess
 import sys
 import time
 import urllib.parse
@@ -86,78 +84,6 @@ def extract_keywords(name, description):
     return deduped
 
 
-def find_display():
-    """Find an available X display — same logic as the run route.
-    Priority: existing DISPLAY env → VNC :1-:5 → start Xvfb :99 → None (headless).
-    """
-    # 1. Check if DISPLAY env is set and the X server is reachable
-    display = os.environ.get("DISPLAY")
-    if display:
-        try:
-            subprocess.run(
-                ["xset", "q"],
-                env={**os.environ, "DISPLAY": display},
-                timeout=3,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                check=True,
-            )
-            return display, "existing DISPLAY env"
-        except Exception:
-            pass  # display not reachable, try others
-
-    # 2. Scan for VNC displays :1 through :5
-    for d in range(1, 6):
-        candidate = f":{d}"
-        try:
-            subprocess.run(
-                ["xset", "q"],
-                env={**os.environ, "DISPLAY": candidate},
-                timeout=3,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                check=True,
-            )
-            return candidate, f"VNC display {candidate}"
-        except Exception:
-            pass
-
-    # 3. Start Xvfb on :99
-    xvfb = shutil.which("Xvfb")
-    if xvfb:
-        try:
-            # Kill any existing Xvfb on :99
-            subprocess.run(["pkill", "-f", "Xvfb :99"],
-                         timeout=2, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except Exception:
-            pass
-        try:
-            subprocess.Popen(
-                [xvfb, ":99", "-screen", "0", "1920x1080x24", "-ac",
-                 "+extension", "RANDR"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            # Wait for it to be ready (poll for up to 4 seconds)
-            for _ in range(20):
-                try:
-                    subprocess.run(
-                        ["xset", "q"],
-                        env={**os.environ, "DISPLAY": ":99"},
-                        timeout=1,
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                        check=True,
-                    )
-                    return ":99", "Xvfb :99 (started by helper)"
-                except Exception:
-                    time.sleep(0.2)
-        except Exception:
-            pass
-
-    return None, "headless (no display available)"
-
-
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--subreddit", required=True)
@@ -205,10 +131,6 @@ def main():
     except ImportError:
         pass
 
-    # Detect display for headed mode
-    display, display_method = find_display()
-    use_headless = display is None
-
     display_name = subreddit_name
     description = ""
     subscribers = 0
@@ -229,10 +151,6 @@ def main():
             "duration_ms": duration_ms,
         })
 
-    log_diag("display_detection", "", 200 if display else 0, "",
-             f"display={display}, method={display_method}, headless={use_headless}",
-             False, 0)
-
     log_diag("stealth_status", "", 200 if stealth else 0, "",
              "playwright-stealth available" if stealth else "playwright-stealth NOT installed",
              False, 0)
@@ -246,7 +164,7 @@ def main():
             ]
             browser = p.chromium.launch_persistent_context(
                 user_data_dir=profile_dir,
-                headless=use_headless,
+                headless=True,
                 args=launch_args,
                 viewport={"width": 1280, "height": 800},
                 locale="en-US",
@@ -610,8 +528,6 @@ def main():
             "search_results": search_results,
             "queries_used": queries,
             "diagnostics": diagnostics,
-            "display_used": display or "headless",
-            "display_method": display_method,
         }))
 
     except Exception as exc:

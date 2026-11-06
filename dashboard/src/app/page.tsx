@@ -474,7 +474,7 @@ export default function Home() {
   // ============================================================
   // AUTO-SYNC — silent background sync.
   //
-  // Every 5 minutes when the dashboard is open AND a CSV is selected,
+  // Every 24 HOURS when the dashboard is open AND a CSV is selected,
   // we silently call /api/sync-subscriptions in the background. If new
   // subs are detected (subs the user joined manually on Reddit that
   // aren't in the CSV yet), they get added as "pending" + a
@@ -486,7 +486,7 @@ export default function Home() {
   //
   // NOTE: runAutoSync is stored in a ref so the interval effect below
   // doesn't get torn down and recreated when `syncing` changes (which
-  // would reset the 5-minute timer every time the user clicks Sync).
+  // would reset the 24-hour timer every time the user clicks Sync).
   // ============================================================
   const [lastAutoSync, setLastAutoSync] = useState<Date | null>(null);
   const [autoSyncResult, setAutoSyncResult] = useState<{
@@ -536,23 +536,31 @@ export default function Home() {
     runAutoSyncRef.current = runAutoSync;
   }, [runAutoSync]);
 
-  // Run auto-sync every 5 minutes. Only depends on selectedCsv so the
+  // Run auto-sync every 24 hours. Only depends on selectedCsv so the
   // interval isn't torn down when syncing/runAutoSync changes.
+  // The initial sync runs 60 seconds after dashboard load so the user
+  // sees any new subs they joined while away.
   useEffect(() => {
     if (!selectedCsv) return;
     const initialTimer = setTimeout(() => {
       runAutoSyncRef.current();
-    }, 30000);
+    }, 60000);
 
     const interval = setInterval(() => {
       if (document.visibilityState === "visible") {
         runAutoSyncRef.current();
       }
-    }, 5 * 60 * 1000);
+    }, 24 * 60 * 60 * 1000); // 24 hours
 
     const handleVisibility = () => {
       if (document.visibilityState === "visible") {
-        setTimeout(() => runAutoSyncRef.current(), 3000);
+        // Only auto-sync on tab focus if the last sync was > 1 hour ago.
+        // This prevents spamming sync on rapid tab switches while still
+        // catching new subs reasonably quickly.
+        const oneHourAgo = Date.now() - 60 * 60 * 1000;
+        if (!lastAutoSync || lastAutoSync.getTime() < oneHourAgo) {
+          setTimeout(() => runAutoSyncRef.current(), 3000);
+        }
       }
     };
     document.addEventListener("visibilitychange", handleVisibility);
@@ -562,7 +570,7 @@ export default function Home() {
       clearInterval(interval);
       document.removeEventListener("visibilitychange", handleVisibility);
     };
-  }, [selectedCsv]);
+  }, [selectedCsv, lastAutoSync]);
 
   const handleFileUpload = useCallback(async (file: File) => {
     setUploading(true);
@@ -1365,7 +1373,7 @@ export default function Home() {
                   </p>
                   <p className="text-[10px] text-slate-500 mt-1">
                     Detected at {autoSyncResult.timestamp.toLocaleTimeString(undefined, { hour12: false })}
-                    {" · "}Next auto-sync in 5 minutes
+                    {" · "}Next auto-sync in 24 hours
                   </p>
                 </div>
                 <Button
@@ -2045,7 +2053,7 @@ export default function Home() {
             {lastAutoSync && (
               <>
                 <span>·</span>
-                <span title="Background sync runs every 5 minutes to auto-detect subs you joined on Reddit">
+                <span title="Background sync runs every 24 hours to auto-detect subs you joined on Reddit">
                   Auto-sync: {formatRelativeTime(lastAutoSync.toISOString())}
                 </span>
               </>

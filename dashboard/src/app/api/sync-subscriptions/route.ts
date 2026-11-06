@@ -47,8 +47,6 @@ const FETCH_SCRIPT = `
 import json
 import sys
 import os
-import shutil
-import subprocess
 import time
 from pathlib import Path
 
@@ -64,46 +62,6 @@ def log_diag(step, url, status, content_type, body_snippet, is_json, duration_ms
         "is_json": is_json,
         "duration_ms": duration_ms,
     })
-
-def find_display():
-    """Find an available X display — same logic as the main subscriber."""
-    display = os.environ.get("DISPLAY")
-    if display:
-        try:
-            subprocess.run(["xset", "q"], env={**os.environ, "DISPLAY": display},
-                          timeout=3, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-            return display, "existing DISPLAY env"
-        except Exception:
-            pass
-    for d in range(1, 6):
-        candidate = f":{d}"
-        try:
-            subprocess.run(["xset", "q"], env={**os.environ, "DISPLAY": candidate},
-                          timeout=3, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-            return candidate, f"VNC display {candidate}"
-        except Exception:
-            pass
-    xvfb = shutil.which("Xvfb")
-    if xvfb:
-        try:
-            subprocess.run(["pkill", "-f", "Xvfb :99"], timeout=2,
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except Exception:
-            pass
-        try:
-            subprocess.Popen([xvfb, ":99", "-screen", "0", "1920x1080x24", "-ac",
-                            "+extension", "RANDR"],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            for _ in range(20):
-                try:
-                    subprocess.run(["xset", "q"], env={**os.environ, "DISPLAY": ":99"},
-                                  timeout=1, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-                    return ":99", "Xvfb :99 (started by helper)"
-                except Exception:
-                    time.sleep(0.2)
-        except Exception:
-            pass
-    return None, "headless (no display available)"
 
 try:
     from playwright.sync_api import sync_playwright
@@ -130,12 +88,6 @@ try:
         log_diag("stealth_status", "", 0, "",
                  "playwright-stealth NOT installed", False, 0)
 
-    display, display_method = find_display()
-    use_headless = display is None
-
-    log_diag("display_detection", "", 200 if display else 0, "",
-             f"display={display}, method={display_method}, headless={use_headless}",
-             False, 0)
     log_diag("stealth_status", "", 200 if stealth else 0, "",
              "playwright-stealth available" if stealth else "NOT installed", False, 0)
 
@@ -149,7 +101,7 @@ try:
         ]
         browser = p.chromium.launch_persistent_context(
             user_data_dir=profile_dir,
-            headless=use_headless,
+            headless=True,
             args=launch_args,
             viewport={"width": 1280, "height": 800},
             locale="en-US",
@@ -337,8 +289,6 @@ try:
         "ok": True,
         "subreddits": subreddits,
         "diagnostics": diagnostics,
-        "display_used": display or "headless",
-        "display_method": display_method,
     }))
 
 except Exception as e:
