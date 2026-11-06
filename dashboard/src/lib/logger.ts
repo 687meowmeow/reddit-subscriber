@@ -46,23 +46,39 @@ const MAX_RING_BUFFER = 2000;       // keep last 2000 entries in memory
 const MAX_FILE_SIZE = 5 * 1024 * 1024; // 5 MB before rotation
 const MAX_FILE_SIZE_SYNC = 5 * 1024 * 1024;
 
+// Listener type for SSE streaming — called with each new log entry.
+type LogListener = (entry: LogEntry) => void;
+
 class Logger {
   private logFile: string;
   private ringBuffer: LogEntry[] = [];
   private writeQueue: Promise<void> = Promise.resolve();
   private seq = 0;
+  // SSE listeners — registered by /api/logs/stream route.
+  // Each listener is called synchronously when a new entry is appended.
+  private listeners: Set<LogListener> = new Set();
 
   constructor() {
-    // Log file lives in the dashboard's working directory (the
-    // dashboard/ folder). It's added to .gitignore so it doesn't
-    // pollute the repo.
     this.logFile = path.join(process.cwd(), ".dashboard.log");
+  }
+
+  /**
+   * Register a listener that will be called with each new log entry.
+   * Returns an unsubscribe function. Used by the /api/logs/stream SSE
+   * endpoint to push new entries to connected clients in real time.
+   */
+  subscribe(listener: LogListener): () => void {
+    this.listeners.add(listener);
+    return () => {
+      this.listeners.delete(listener);
+    };
   }
 
   /**
    * Internal: append a single entry to both the ring buffer and the
    * log file. Writes are serialized via a Promise chain to avoid
-   * interleaved writes from concurrent requests.
+   * interleaved writes from concurrent requests. Also notifies all
+   * SSE listeners.
    */
   private append(entry: LogEntry): void {
     // 1. Push to ring buffer (synchronous)
@@ -71,13 +87,21 @@ class Logger {
       this.ringBuffer.shift();
     }
 
-    // 2. Append to file (serialized via queue)
+    // 2. Notify SSE listeners (synchronous — they just push to a stream)
+    for (const listener of this.listeners) {
+      try {
+        listener(entry);
+      } catch (err) {
+        // Don't let a broken listener kill the logger
+        console.error("[logger] SSE listener error:", err);
+      }
+    }
+
+    // 3. Append to file (serialized via queue)
     const line = JSON.stringify(entry) + "\n";
     this.writeQueue = this.writeQueue
       .then(() => this.writeLine(line))
       .catch((err) => {
-        // Don't let a write failure kill the queue — log to stderr
-        // and continue. The ring buffer still has the entry.
         console.error("[logger] file write failed:", err);
       });
   }
@@ -177,22 +201,49 @@ class Logger {
    *   - Passwords (Reddit or GitHub PAT)
    *   - Session cookies
    *   - Authorization headers
+   *
+   * Handles circular references by using a replacer function instead
+   * of JSON.parse(JSON.stringify(data)) which throws on circular refs.
    */
   private sanitize(data: any): any {
     if (data == null) return data;
     if (typeof data !== "object") return data;
-    // Deep-clone (cheap for small payloads) and walk for sensitive keys
+
+    // Use a replacer to handle circular references safely.
+    // The replacer also walks sensitive keys and redacts them.
+    const seen = new WeakSet();
     try {
-      const clone = JSON.parse(JSON.stringify(data));
-      this.sanitizeInPlace(clone);
-      return clone;
+      const json = JSON.stringify(data, (key, value) => {
+        const lower = key.toLowerCase();
+        if (
+          lower.includes("password") ||
+          lower.includes("secret") ||
+          lower.includes("token") ||
+          lower.includes("pat") ||
+          lower.includes("authorization") ||
+          lower.includes("cookie")
+        ) {
+          return "[REDACTED]";
+        }
+        // Handle circular references
+        if (typeof value === "object" && value !== null) {
+          if (seen.has(value)) {
+            return "[Circular]";
+          }
+          seen.add(value);
+        }
+        return value;
+      });
+      return JSON.parse(json);
     } catch {
-      // Not serializable — return as-is but log a warning
+      // Still not serializable (e.g., functions, BigInt)
       return "[unserializable]";
     }
   }
 
   private sanitizeInPlace(obj: any): void {
+    // Kept for backwards compat but no longer used — sanitize() now
+    // does redaction inline via the JSON.stringify replacer.
     if (obj == null || typeof obj !== "object") return;
     if (Array.isArray(obj)) {
       for (const item of obj) this.sanitizeInPlace(item);

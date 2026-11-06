@@ -483,6 +483,10 @@ export default function Home() {
   //
   // The auto-sync uses a SEPARATE state from the manual Sync button
   // so it doesn't trigger the spinner UI.
+  //
+  // NOTE: runAutoSync is stored in a ref so the interval effect below
+  // doesn't get torn down and recreated when `syncing` changes (which
+  // would reset the 5-minute timer every time the user clicks Sync).
   // ============================================================
   const [lastAutoSync, setLastAutoSync] = useState<Date | null>(null);
   const [autoSyncResult, setAutoSyncResult] = useState<{
@@ -491,14 +495,9 @@ export default function Home() {
     timestamp: Date;
   } | null>(null);
   const autoSyncInProgressRef = useRef<boolean>(false);
+  const runAutoSyncRef = useRef<() => void>(() => {});
 
   const runAutoSync = useCallback(async () => {
-    // Don't run if:
-    //   - No CSV is selected
-    //   - A manual sync is already in progress (avoid concurrent runs)
-    //   - An auto-sync is already in progress
-    //   - The dashboard tab is hidden (browser throttles anyway, but
-    //     we also don't want to waste Pi CPU when no one is looking)
     if (!selectedCsv) return;
     if (syncing) return;
     if (autoSyncInProgressRef.current) return;
@@ -515,51 +514,45 @@ export default function Home() {
       setLastAutoSync(new Date());
 
       if (data.ok && data.added > 0) {
-        // New subs detected! Show a notification banner.
         setAutoSyncResult({
           added: data.added,
           added_names: data.added_names || [],
           timestamp: new Date(),
         });
-        // Auto-dismiss after 60 seconds
         setTimeout(() => setAutoSyncResult(null), 60000);
-        // Refresh the CSV so the new rows show up immediately
         fetchCsvData(selectedCsv);
       }
-      // If added === 0, do nothing — silent success. We don't want to
-      // bother the user every 5 minutes with "no new subs found".
     } catch (err) {
-      // Silent failure — don't disrupt the UI. The error will show up
-      // in the server logs (/logs page) for debugging.
       console.warn("Auto-sync failed:", err);
     } finally {
       autoSyncInProgressRef.current = false;
     }
   }, [selectedCsv, syncing, fetchCsvData]);
 
-  // Run auto-sync every 5 minutes when the dashboard is open
+  // Keep the ref updated with the latest version of runAutoSync.
+  // The interval effect uses runAutoSyncRef.current() so it always
+  // calls the latest function without needing to be recreated.
+  useEffect(() => {
+    runAutoSyncRef.current = runAutoSync;
+  }, [runAutoSync]);
+
+  // Run auto-sync every 5 minutes. Only depends on selectedCsv so the
+  // interval isn't torn down when syncing/runAutoSync changes.
   useEffect(() => {
     if (!selectedCsv) return;
-    // Initial sync 30 seconds after the dashboard loads (gives the
-    // user time to see the dashboard before we start fetching)
     const initialTimer = setTimeout(() => {
-      runAutoSync();
+      runAutoSyncRef.current();
     }, 30000);
 
-    // Then every 5 minutes
     const interval = setInterval(() => {
       if (document.visibilityState === "visible") {
-        runAutoSync();
+        runAutoSyncRef.current();
       }
-    }, 5 * 60 * 1000); // 5 minutes
+    }, 5 * 60 * 1000);
 
-    // Also kick an auto-sync when the tab becomes visible again
-    // (the user may have joined subs on Reddit in another tab)
     const handleVisibility = () => {
       if (document.visibilityState === "visible") {
-        // Wait 3 seconds before syncing so the regular CSV refresh
-        // has time to complete first
-        setTimeout(() => runAutoSync(), 3000);
+        setTimeout(() => runAutoSyncRef.current(), 3000);
       }
     };
     document.addEventListener("visibilitychange", handleVisibility);
@@ -569,7 +562,7 @@ export default function Home() {
       clearInterval(interval);
       document.removeEventListener("visibilitychange", handleVisibility);
     };
-  }, [selectedCsv, runAutoSync]);
+  }, [selectedCsv]);
 
   const handleFileUpload = useCallback(async (file: File) => {
     setUploading(true);

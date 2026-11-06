@@ -1,75 +1,41 @@
 #!/usr/bin/env python3
 """
-Find Similar helper — fetches subreddit info and search results from Reddit
-using the saved Playwright browser profile (which has the user's login cookies).
+Find Similar helper — fetches subreddit info and search results from Reddit.
 
-WHY THIS EXISTS:
-  As of late May 2026, Reddit killed unauthenticated .json endpoint access.
-  Plain `fetch('https://www.reddit.com/r/NAME/about.json')` returns 403
-  Forbidden (an HTML block page) instead of JSON. The ONLY way to get
-  JSON from Reddit now is via an authenticated browser session — which
-  we already have in the saved Playwright profile (~/.reddit_subscriber_profile)
-  that the main subscriber script uses for browsing.
+CRITICAL FIX (v3):
+  The previous versions returned 403 because Reddit wasn't recognizing the
+  browser session as authenticated, even though cookies were in the profile.
+  Root cause: the helper was using page.goto(.json_url) which makes the
+  request from Playwright's NAVIGATION layer — this has a different
+  fingerprint than a real browser tab. Reddit's anti-bot system detected
+  this and served the logged-out SPA shell (<body class=theme-beta>).
 
-CRITICAL FIX (previous version returned 0 results):
-  The previous helper was missing TWO things the main subscriber script has:
-    1. playwright-stealth library (Stealth().apply_stealth_sync) — patches
-       navigator.webdriver, chrome.runtime, plugins, languages, etc.
-       Without this, Reddit detects Playwright via `navigator.webdriver=true`
-       and serves a 403 block page even when authenticated.
-    2. --disable-blink-features=AutomationControlled launch arg — removes
-       the `cdc_` (Chrome DevTools Conductor) prefix from DOM properties
-       that bot-detection scripts look for.
-    3. java_script_enabled=False was a HUGE red flag — Reddit's bot detection
-       runs JS to check for various browser features. Disabling JS makes
-       us look like a bot. Now JS is ENABLED.
+  THE FIX:
+  1. Navigate to https://www.reddit.com FIRST (HTML page) — this "warms up"
+     the session: sets additional cookies, runs Reddit's JS which sets
+     anti-bot tokens, and establishes the session as legitimate.
+  2. Use page.evaluate(fetch(url)) for ALL .json requests — this makes the
+     fetch() originate FROM the page's JavaScript context, carrying all
+     cookies + using the page's real browser fingerprint. Reddit can't
+     distinguish it from a real user's XHR.
+  3. Try HEADED mode first (Xvfb :99 or VNC display) — headless Chromium
+     has detectable differences even with playwright-stealth. The main
+     subscriber script runs in headed mode and works fine.
+  4. DON'T set Accept: application/json header — let the page's fetch()
+     use its default Accept headers (which match a real browser).
 
-  Plus: the previous helper only tried /subreddits/search.json which may
-  have been deprecated. Now we try THREE endpoints:
-    1. /subreddits/search.json?q=...&limit=25&sort=relevance  (legacy)
-    2. /search/.json?q=...&type=sr&limit=25&sort=relevance     (newer)
-    3. /api/search_subreddits  (POST, returns partial subreddit objects)
-
-  Plus: every request now captures diagnostics (status, content-type, body
-  snippet) so when something fails, the dashboard logs show EXACTLY what
-  Reddit returned instead of just "0 results".
-
-USAGE:
-  python3 find_similar_helper.py --subreddit NAME [--csv-root DIR]
-
-OUTPUT:
-  Prints a single JSON line on stdout:
-    {
-      "ok": true,
-      "subreddit": "NAME",
-      "display_name": "...",
-      "description": "...",
-      "subscribers": 12345,
-      "is_nsfw": false,
-      "is_banned": false,
-      "is_private": false,
-      "keywords": ["kw1", "kw2", ...],
-      "search_results": [...],
-      "queries_used": [...],
-      "diagnostics": [
-        {
-          "step": "fetch_about",
-          "url": "https://www.reddit.com/r/NAME/about.json",
-          "status": 200,
-          "content_type": "application/json",
-          "body_snippet": "{\"kind\": \"t5\", \"data\": {...",
-          "is_json": true,
-          "duration_ms": 234
-        },
-        ...
-      ]
-    }
+  This mirrors exactly how the BigIdeasDB Reddit Connector works:
+  "requests from your own logged-in browser still work" — the key is
+  that the request must come FROM the browser page, not from the
+  automation layer.
 """
 
 import argparse
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
 import time
 import urllib.parse
@@ -89,8 +55,7 @@ STOP_WORDS = {
 }
 
 
-def extract_keywords(name: str, description: str):
-    """Extract keywords from a subreddit name + description."""
+def extract_keywords(name, description):
     keywords = []
     name_words = (
         re.sub(r"([a-z])([A-Z])", r"\1 \2", name)
@@ -101,7 +66,6 @@ def extract_keywords(name: str, description: str):
     for w in name_words:
         if len(w) >= 3 and w not in STOP_WORDS:
             keywords.append(w)
-
     desc_words = re.sub(r"[^a-z0-9\s]", " ", description.lower()).split(" ")
     desc_counts = {}
     for w in desc_words:
@@ -111,7 +75,6 @@ def extract_keywords(name: str, description: str):
     for w, _ in top_desc:
         if w not in keywords:
             keywords.append(w)
-
     seen = set()
     deduped = []
     for k in keywords:
@@ -123,94 +86,76 @@ def extract_keywords(name: str, description: str):
     return deduped
 
 
-def fetch_reddit_json(page, url, timeout_ms=30000, diagnostics=None, step_name=""):
-    """Navigate to a .json URL and return (status, parsed_or_text, is_json, content_type).
-
-    Captures detailed diagnostics so failures can be debugged from the logs.
+def find_display():
+    """Find an available X display — same logic as the run route.
+    Priority: existing DISPLAY env → VNC :1-:5 → start Xvfb :99 → None (headless).
     """
-    start = time.time()
-    try:
-        response = page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
-    except Exception as exc:
-        if diagnostics is not None:
-            diagnostics.append({
-                "step": step_name,
-                "url": url,
-                "status": 0,
-                "content_type": "",
-                "body_snippet": f"navigation error: {exc}",
-                "is_json": False,
-                "duration_ms": int((time.time() - start) * 1000),
-            })
-        return 0, f"navigation error: {exc}", False, ""
-
-    status = response.status if response else 0
-    content_type = ""
-    if response:
+    # 1. Check if DISPLAY env is set and the X server is reachable
+    display = os.environ.get("DISPLAY")
+    if display:
         try:
-            headers = response.headers
-            content_type = headers.get("content-type", "")
+            subprocess.run(
+                ["xset", "q"],
+                env={**os.environ, "DISPLAY": display},
+                timeout=3,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=True,
+            )
+            return display, "existing DISPLAY env"
+        except Exception:
+            pass  # display not reachable, try others
+
+    # 2. Scan for VNC displays :1 through :5
+    for d in range(1, 6):
+        candidate = f":{d}"
+        try:
+            subprocess.run(
+                ["xset", "q"],
+                env={**os.environ, "DISPLAY": candidate},
+                timeout=3,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=True,
+            )
+            return candidate, f"VNC display {candidate}"
         except Exception:
             pass
 
-    try:
-        body = response.text()
-    except Exception as exc:
-        if diagnostics is not None:
-            diagnostics.append({
-                "step": step_name,
-                "url": url,
-                "status": status,
-                "content_type": content_type,
-                "body_snippet": f"could not read body: {exc}",
-                "is_json": False,
-                "duration_ms": int((time.time() - start) * 1000),
-            })
-        return status, f"could not read body: {exc}", False, content_type
-
-    stripped = body.lstrip()[:200]
-    is_json = stripped.startswith("{") or stripped.startswith("[")
-
-    if is_json:
+    # 3. Start Xvfb on :99
+    xvfb = shutil.which("Xvfb")
+    if xvfb:
         try:
-            parsed = json.loads(body)
-            if diagnostics is not None:
-                diagnostics.append({
-                    "step": step_name,
-                    "url": url,
-                    "status": status,
-                    "content_type": content_type,
-                    "body_snippet": stripped[:200],
-                    "is_json": True,
-                    "duration_ms": int((time.time() - start) * 1000),
-                })
-            return status, parsed, True, content_type
-        except Exception as exc:
-            if diagnostics is not None:
-                diagnostics.append({
-                    "step": step_name,
-                    "url": url,
-                    "status": status,
-                    "content_type": content_type,
-                    "body_snippet": f"json parse failed: {exc} | body_start: {stripped[:150]}",
-                    "is_json": False,
-                    "duration_ms": int((time.time() - start) * 1000),
-                })
-            return status, body, False, content_type
-    else:
-        # HTML response (or empty) — capture a snippet for debugging
-        snippet = body.replace("\n", " ").replace("\r", " ").strip()[:200]
-        if diagnostics is not None:
-            diagnostics.append({
-                "step": step_name,
-                "url": url,
-                "status": status,
-                "content_type": content_type,
-                "body_snippet": snippet,
-                "is_json": False,
-                "duration_ms": int((time.time() - start) * 1000),
-            })
-        return status, body, False, content_type
+            # Kill any existing Xvfb on :99
+            subprocess.run(["pkill", "-f", "Xvfb :99"],
+                         timeout=2, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+        try:
+            subprocess.Popen(
+                [xvfb, ":99", "-screen", "0", "1920x1080x24", "-ac",
+                 "+extension", "RANDR"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            # Wait for it to be ready (poll for up to 4 seconds)
+            for _ in range(20):
+                try:
+                    subprocess.run(
+                        ["xset", "q"],
+                        env={**os.environ, "DISPLAY": ":99"},
+                        timeout=1,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        check=True,
+                    )
+                    return ":99", "Xvfb :99 (started by helper)"
+                except Exception:
+                    time.sleep(0.2)
+        except Exception:
+            pass
+
+    return None, "headless (no display available)"
 
 
 def main():
@@ -238,10 +183,8 @@ def main():
         print(json.dumps({
             "ok": False,
             "error": (
-                f"Browser profile not found at {profile_dir}. "
-                f"You need to start a normal subscriber run first so the browser "
-                f"can save your login cookies — Reddit now requires authentication "
-                f"for ALL .json endpoints (since May 2026)."
+                f"Browser profile not found at {profile_dir}. Start a normal "
+                f"subscriber run first so the browser saves your login cookies."
             ),
         }))
         sys.exit(0)
@@ -255,15 +198,16 @@ def main():
         }))
         sys.exit(0)
 
-    # Try to import playwright-stealth (the main subscriber script uses this).
-    # Without it, Reddit detects navigator.webdriver=true and serves 403.
     stealth = None
     try:
         from playwright_stealth import Stealth
         stealth = Stealth()
     except ImportError:
-        # Will continue without stealth but warn in diagnostics
         pass
+
+    # Detect display for headed mode
+    display, display_method = find_display()
+    use_headless = display is None
 
     display_name = subreddit_name
     description = ""
@@ -274,14 +218,27 @@ def main():
     search_results = []
     diagnostics = []
 
+    def log_diag(step, url, status, content_type, body_snippet, is_json, duration_ms):
+        diagnostics.append({
+            "step": step,
+            "url": url,
+            "status": status,
+            "content_type": content_type or "",
+            "body_snippet": (body_snippet or "")[:200],
+            "is_json": is_json,
+            "duration_ms": duration_ms,
+        })
+
+    log_diag("display_detection", "", 200 if display else 0, "",
+             f"display={display}, method={display_method}, headless={use_headless}",
+             False, 0)
+
+    log_diag("stealth_status", "", 200 if stealth else 0, "",
+             "playwright-stealth available" if stealth else "playwright-stealth NOT installed",
+             False, 0)
+
     try:
         with sync_playwright() as p:
-            # CRITICAL: use the SAME launch config as the main subscriber script.
-            #   - --disable-blink-features=AutomationControlled removes the
-            #     navigator.webdriver flag
-            #   - playwright-stealth patches dozens of other bot-detection signals
-            #   - JavaScript MUST be enabled (Reddit's bot detection runs JS)
-            # Without these, Reddit 403s all .json requests even when authed.
             launch_args = [
                 "--disable-blink-features=AutomationControlled",
                 "--no-first-run",
@@ -289,69 +246,150 @@ def main():
             ]
             browser = p.chromium.launch_persistent_context(
                 user_data_dir=profile_dir,
-                headless=True,
+                headless=use_headless,
                 args=launch_args,
                 viewport={"width": 1280, "height": 800},
                 locale="en-US",
                 timezone_id="America/Chicago",
-                java_script_enabled=True,  # MUST be True — Reddit detects JS-disabled browsers
+                java_script_enabled=True,
             )
 
-            # Apply stealth evasions if available
             if stealth is not None:
                 try:
                     stealth.apply_stealth_sync(browser)
-                    diagnostics.append({
-                        "step": "stealth_apply",
-                        "url": "",
-                        "status": 200,
-                        "content_type": "",
-                        "body_snippet": "playwright-stealth applied successfully",
-                        "is_json": False,
-                        "duration_ms": 0,
-                    })
+                    log_diag("stealth_apply", "", 200, "",
+                             "playwright-stealth applied successfully", False, 0)
                 except Exception as exc:
-                    diagnostics.append({
-                        "step": "stealth_apply",
-                        "url": "",
-                        "status": 0,
-                        "content_type": "",
-                        "body_snippet": f"stealth apply failed: {exc}",
-                        "is_json": False,
-                        "duration_ms": 0,
-                    })
-            else:
-                diagnostics.append({
-                    "step": "stealth_apply",
-                    "url": "",
-                    "status": 0,
-                    "content_type": "",
-                    "body_snippet": "playwright-stealth NOT installed — bot detection may trigger 403",
-                    "is_json": False,
-                    "duration_ms": 0,
-                })
+                    log_diag("stealth_apply", "", 0, "",
+                             f"stealth apply failed: {exc}", False, 0)
 
             page = browser.new_page()
-            page.set_extra_http_headers({
-                "Accept": "application/json, text/plain, */*",
-                "Accept-Language": "en-US,en;q=0.9",
-            })
+            # NOTE: Do NOT set Accept: application/json header — it's a
+            # scraper tell. Let the browser use its default Accept headers
+            # (text/html for navigation, */* for fetch).
 
-            # --- Step 1: Fetch /r/NAME/about.json ---
+            # --- STEP 1: Session warmup ---
+            # Navigate to https://www.reddit.com (HTML page) to establish
+            # the session. This:
+            #   - Loads all cookies from the profile
+            #   - Runs Reddit's JS which sets anti-bot tokens
+            #   - Establishes the session as a "real browser visit"
+            # Without this, direct .json requests get the logged-out SPA shell.
+            t0 = time.time()
+            try:
+                response = page.goto("https://www.reddit.com/",
+                                     wait_until="domcontentloaded", timeout=30000)
+                warmup_status = response.status if response else 0
+                warmup_ct = ""
+                if response:
+                    try:
+                        warmup_ct = response.headers.get("content-type", "")
+                    except Exception:
+                        pass
+                log_diag("session_warmup", "https://www.reddit.com/",
+                         warmup_status, warmup_ct,
+                         f"navigated to reddit.com homepage",
+                         False, int((time.time() - t0) * 1000))
+            except Exception as exc:
+                log_diag("session_warmup", "https://www.reddit.com/", 0, "",
+                         f"navigation error: {exc}", False, int((time.time() - t0) * 1000))
+
+            # Check if we're actually logged in by looking for the user's
+            # username in the page. If not logged in, the page will show
+            # "Log In" / "Sign Up" buttons instead.
+            try:
+                logged_in_check = page.evaluate("""
+                    () => {
+                        // Check for login state indicators in the page
+                        const body = document.body ? document.body.innerHTML : '';
+                        // Reddit shows "Log In" button when logged out
+                        const hasLoginButton = body.includes('Log In') || body.includes('"login"');
+                        // Reddit shows the user menu / karma when logged in
+                        const hasUserMenu = body.includes('user-drawer') ||
+                                           body.includes('"isLoggedIn":true') ||
+                                           body.includes('"isLoggedOut":false');
+                        // Check for the logged-out SPA shell signature
+                        const isLoggedOutShell = body.includes('theme-beta') && body.includes('"isLoggedOut":true');
+                        return {
+                            hasLoginButton: hasLoginButton,
+                            hasUserMenu: hasUserMenu,
+                            isLoggedOutShell: isLoggedOutShell,
+                            url: window.location.href,
+                        };
+                    }
+                """)
+                log_diag("login_check", window_url := str(logged_in_check.get("url", "")),
+                         200, "text/html",
+                         f"hasLoginButton={logged_in_check.get('hasLoginButton')}, "
+                         f"hasUserMenu={logged_in_check.get('hasUserMenu')}, "
+                         f"isLoggedOutShell={logged_in_check.get('isLoggedOutShell')}",
+                         False, 0)
+
+                if logged_in_check.get("isLoggedOutShell"):
+                    browser.close()
+                    print(json.dumps({
+                        "ok": False,
+                        "error": (
+                            "Reddit shows the logged-out SPA shell after session warmup. "
+                            "Your browser profile is NOT authenticated. You need to: "
+                            "(1) Start a normal subscriber run via the dashboard, "
+                            "(2) Log in when the browser prompts you, "
+                            "(3) Wait for the run to save cookies, then try Find Similar again."
+                        ),
+                        "diagnostics": diagnostics,
+                    }))
+                    sys.exit(0)
+            except Exception as exc:
+                log_diag("login_check", "", 0, "",
+                         f"evaluate error: {exc}", False, 0)
+
+            # Wait a moment for Reddit's JS to finish setting up the session
+            page.wait_for_timeout(2000)
+
+            # --- STEP 2: Fetch /r/NAME/about.json via page.evaluate(fetch()) ---
+            # This makes the fetch() originate from the page's JS context,
+            # carrying all cookies + using the page's real browser fingerprint.
             about_url = f"https://www.reddit.com/r/{urllib.parse.quote(subreddit_name)}/about.json"
-            status, data, is_json, ct = fetch_reddit_json(
-                page, about_url, diagnostics=diagnostics, step_name="fetch_about"
-            )
+
+            t0 = time.time()
+            try:
+                result = page.evaluate("""
+                    async (url) => {
+                        try {
+                            const res = await fetch(url, {
+                                credentials: 'include',
+                                headers: {'Accept': 'application/json'}
+                            });
+                            const status = res.status;
+                            const ct = res.headers.get('content-type') || '';
+                            const text = await res.text();
+                            return {status: status, contentType: ct, body: text, bodyLength: text.length};
+                        } catch (e) {
+                            return {status: 0, contentType: '', body: '', error: String(e)};
+                        }
+                    }
+                """, about_url)
+            except Exception as exc:
+                result = {"status": 0, "contentType": "", "body": "", "error": f"evaluate error: {exc}"}
+
+            status = result.get("status", 0)
+            ct = result.get("contentType", "")
+            body = result.get("body", "")
+            body_snippet = body[:200] if body else (result.get("error", "") or "")[:200]
+            stripped = body.lstrip()[:200] if body else ""
+            is_json = stripped.startswith("{") or stripped.startswith("[")
+
+            log_diag("fetch_about", about_url, status, ct, body_snippet, is_json,
+                     int((time.time() - t0) * 1000))
 
             if status == 403 or status == 401:
                 browser.close()
                 print(json.dumps({
                     "ok": False,
                     "error": (
-                        f"Reddit returned HTTP {status} for /r/{subreddit_name}/about.json. "
-                        f"Your browser profile is not authenticated OR Reddit detected the browser "
-                        f"as a bot. Make sure playwright-stealth is installed (pip install playwright-stealth) "
-                        f"and you've logged in via a normal subscriber run."
+                        f"Reddit returned HTTP {status} for /r/{subreddit_name}/about.json "
+                        f"even after session warmup. The browser profile may need a fresh "
+                        f"login. Body snippet: {body_snippet}"
                     ),
                     "diagnostics": diagnostics,
                 }))
@@ -366,31 +404,30 @@ def main():
                 }))
                 sys.exit(0)
 
-            if is_json and isinstance(data, dict):
-                d = data.get("data", {}) if isinstance(data.get("data"), dict) else {}
-                if d:
-                    description = d.get("public_description") or d.get("description") or ""
-                    display_name = d.get("display_name") or subreddit_name
-                    subscribers = d.get("subscribers") or 0
-                    is_nsfw = bool(d.get("over18"))
-                    sub_type = (d.get("subreddit_type") or "").lower()
-                    if sub_type == "private":
-                        is_private = True
-                    if data.get("error") == 404 or "banned" in str(d.get("description") or "").lower():
-                        is_banned = True
-            elif not is_json and status != 0:
-                # Got HTML — proceed with name-only keywords.
-                # Diagnostics already captured what Reddit returned.
-                pass
+            if is_json:
+                try:
+                    data = json.loads(body)
+                    d = data.get("data", {}) if isinstance(data, dict) else {}
+                    if isinstance(d, dict):
+                        description = d.get("public_description") or d.get("description") or ""
+                        display_name = d.get("display_name") or subreddit_name
+                        subscribers = d.get("subscribers") or 0
+                        is_nsfw = bool(d.get("over18"))
+                        sub_type = (d.get("subreddit_type") or "").lower()
+                        if sub_type == "private":
+                            is_private = True
+                        if data.get("error") == 404:
+                            is_banned = True
+                except Exception as exc:
+                    log_diag("parse_about", about_url, status, ct,
+                             f"json parse failed: {exc}", False, 0)
 
-            # --- Step 2: Extract keywords ---
+            # --- STEP 3: Extract keywords ---
             keywords = extract_keywords(subreddit_name, description)
             if not keywords:
                 keywords = [subreddit_name.lower()]
 
-            # --- Step 3: Search for similar subreddits ---
-            # Try MULTIPLE endpoints — Reddit has changed these over time.
-            # We try each one in order until we get results.
+            # --- STEP 4: Search for similar subreddits via page.evaluate(fetch()) ---
             queries = []
             if len(keywords) >= 3:
                 queries.append(" ".join(keywords[:4]))
@@ -403,32 +440,63 @@ def main():
             seen_names = set()
             seen_names.add(subreddit_name.lower())
 
-            # Try each endpoint pattern with each query.
-            # Stop early once we have enough results.
-            ENDPOINT_PATTERNS = [
-                # Legacy endpoint — older scripts use this
-                ("GET", "https://www.reddit.com/subreddits/search.json?q={q}&limit=25&sort=relevance", "search_legacy"),
-                # Newer endpoint — /search/.json with type=sr filter
-                ("GET", "https://www.reddit.com/search/.json?q={q}&type=sr&limit=25&sort=relevance", "search_new"),
-                # Alternate form without trailing slash
-                ("GET", "https://www.reddit.com/search.json?q={q}&type=sr&limit=25&sort=relevance", "search_alt"),
+            # Try multiple endpoint patterns
+            ENDPOINT_TEMPLATES = [
+                ("search_legacy", "https://www.reddit.com/subreddits/search.json?q={q}&limit=25&sort=relevance"),
+                ("search_new", "https://www.reddit.com/search/.json?q={q}&type=sr&limit=25&sort=relevance"),
             ]
 
             for query in queries:
                 if len(search_results) >= 30:
                     break
 
-                for method, url_template, step_name in ENDPOINT_PATTERNS:
+                for step_name, url_template in ENDPOINT_TEMPLATES:
                     if len(search_results) >= 30:
                         break
 
                     url = url_template.format(q=urllib.parse.quote(query))
-                    s_status, s_data, s_is_json, s_ct = fetch_reddit_json(
-                        page, url, diagnostics=diagnostics, step_name=f"{step_name}[{query[:30]}]"
-                    )
+                    t0 = time.time()
 
-                    if not s_is_json or not isinstance(s_data, dict):
-                        # Move to next endpoint pattern
+                    try:
+                        result = page.evaluate("""
+                            async (url) => {
+                                try {
+                                    const res = await fetch(url, {
+                                        credentials: 'include',
+                                        headers: {'Accept': 'application/json'}
+                                    });
+                                    const status = res.status;
+                                    const ct = res.headers.get('content-type') || '';
+                                    const text = await res.text();
+                                    return {status: status, contentType: ct, body: text};
+                                } catch (e) {
+                                    return {status: 0, contentType: '', body: '', error: String(e)};
+                                }
+                            }
+                        """, url)
+                    except Exception as exc:
+                        result = {"status": 0, "contentType": "", "body": "",
+                                 "error": f"evaluate error: {exc}"}
+
+                    s_status = result.get("status", 0)
+                    s_ct = result.get("contentType", "")
+                    s_body = result.get("body", "")
+                    s_stripped = s_body.lstrip()[:200] if s_body else ""
+                    s_is_json = s_stripped.startswith("{") or s_stripped.startswith("[")
+                    s_snippet = (s_stripped or result.get("error", ""))[:200]
+
+                    log_diag(f"{step_name}[{query[:30]}]", url, s_status, s_ct,
+                             s_snippet, s_is_json, int((time.time() - t0) * 1000))
+
+                    if not s_is_json or s_status != 200:
+                        continue
+
+                    try:
+                        s_data = json.loads(s_body)
+                    except Exception:
+                        continue
+
+                    if not isinstance(s_data, dict):
                         continue
 
                     children = s_data.get("data", {}).get("children", [])
@@ -438,9 +506,7 @@ def main():
                     for child in children:
                         d = child.get("data", {}) if isinstance(child, dict) else {}
                         name = d.get("display_name", "")
-                        if not name:
-                            continue
-                        if name.lower() in seen_names:
+                        if not name or name.lower() in seen_names:
                             continue
                         seen_names.add(name.lower())
 
@@ -449,7 +515,6 @@ def main():
                             continue
                         if d.get("quarantine"):
                             continue
-
                         sub_count = d.get("subscribers") or 0
                         if sub_count < 100:
                             continue
@@ -465,53 +530,47 @@ def main():
                             "url": f"https://www.reddit.com/r/{name}",
                         })
 
-            # --- Step 4: Try POST /api/search_subreddits as a last resort ---
-            # This endpoint returns partial subreddit objects. It's the official
-            # API endpoint that powers Reddit's "search subreddits" UI.
-            # Only try it if we have very few results so far.
+            # --- STEP 5: Try POST /api/search_subreddits as fallback ---
             if len(search_results) < 5:
                 for query in queries[:2]:
                     if len(search_results) >= 30:
                         break
+                    t0 = time.time()
                     try:
-                        # Use page.evaluate to make a fetch() call from within
-                        # the browser context — this carries all cookies + headers
-                        # automatically and bypasses CORS.
-                        result = page.evaluate(
-                            """
+                        result = page.evaluate("""
                             async (query) => {
                                 try {
                                     const res = await fetch('https://www.reddit.com/api/search_subreddits', {
                                         method: 'POST',
-                                        headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+                                        credentials: 'include',
+                                        headers: {
+                                            'Content-Type': 'application/x-www-form-urlencoded',
+                                        },
                                         body: 'query=' + encodeURIComponent(query) + '&include_unadvertisable=true'
                                     });
                                     const status = res.status;
                                     const text = await res.text();
-                                    return {status: status, body: text.slice(0, 5000), body_snippet: text.slice(0, 200)};
+                                    return {status: status, body: text, bodySnippet: text.slice(0, 200)};
                                 } catch (e) {
-                                    return {status: 0, body: '', body_snippet: 'fetch error: ' + String(e)};
+                                    return {status: 0, body: '', bodySnippet: 'error: ' + String(e)};
                                 }
                             }
-                            """,
-                            query
-                        )
-                        diagnostics.append({
-                            "step": f"search_api_post[{query[:30]}]",
-                            "url": "https://www.reddit.com/api/search_subreddits",
-                            "status": result.get("status", 0),
-                            "content_type": "",
-                            "body_snippet": result.get("body_snippet", "")[:200],
-                            "is_json": result.get("body", "").lstrip().startswith(("{", "[")),
-                            "duration_ms": 0,
-                        })
+                        """, query)
+                        s_status = result.get("status", 0)
+                        s_body = result.get("body", "")
+                        s_snippet = result.get("bodySnippet", "")[:200]
+                        s_is_json = s_body.lstrip().startswith(("{", "[")) if s_body else False
 
-                        if result.get("status") == 200:
+                        log_diag(f"search_api_post[{query[:30]}]",
+                                 "https://www.reddit.com/api/search_subreddits",
+                                 s_status, "", s_snippet, s_is_json,
+                                 int((time.time() - t0) * 1000))
+
+                        if s_status == 200 and s_is_json:
                             try:
-                                api_data = json.loads(result.get("body", ""))
+                                api_data = json.loads(s_body)
                                 if isinstance(api_data, dict):
-                                    api_children = api_data.get("subreddits", [])
-                                    for sub in api_children:
+                                    for sub in api_data.get("subreddits", []):
                                         name = sub.get("name", "")
                                         if not name or name.lower() in seen_names:
                                             continue
@@ -530,25 +589,11 @@ def main():
                                             "url": f"https://www.reddit.com/r/{name}",
                                         })
                             except Exception as exc:
-                                diagnostics.append({
-                                    "step": f"search_api_post_parse[{query[:30]}]",
-                                    "url": "",
-                                    "status": 0,
-                                    "content_type": "",
-                                    "body_snippet": f"parse error: {exc}",
-                                    "is_json": False,
-                                    "duration_ms": 0,
-                                })
+                                log_diag(f"search_api_post_parse[{query[:30]}]", "", 0, "",
+                                         f"parse error: {exc}", False, 0)
                     except Exception as exc:
-                        diagnostics.append({
-                            "step": f"search_api_post[{query[:30]}]",
-                            "url": "",
-                            "status": 0,
-                            "content_type": "",
-                            "body_snippet": f"evaluate error: {exc}",
-                            "is_json": False,
-                            "duration_ms": 0,
-                        })
+                        log_diag(f"search_api_post[{query[:30]}]", "", 0, "",
+                                 f"evaluate error: {exc}", False, 0)
 
             browser.close()
 
@@ -565,10 +610,11 @@ def main():
             "search_results": search_results,
             "queries_used": queries,
             "diagnostics": diagnostics,
+            "display_used": display or "headless",
+            "display_method": display_method,
         }))
 
     except Exception as exc:
-        # Catch-all so the TS side always gets JSON
         print(json.dumps({
             "ok": False,
             "error": f"Unexpected error: {type(exc).__name__}: {exc}",

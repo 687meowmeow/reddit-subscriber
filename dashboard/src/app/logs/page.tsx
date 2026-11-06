@@ -140,22 +140,82 @@ function LogsContent() {
     }
   }, [levelFilter, debouncedSearch]);
 
-  // Initial load
+  // Initial load — fetch recent history
   useEffect(() => {
     setLoading(true);
     fetchLogs().finally(() => setLoading(false));
   }, [fetchLogs]);
 
-  // Auto-refresh poller
+  // ============================================================
+  // SSE (Server-Sent Events) — real-time log streaming.
+  //
+  // Instead of polling /api/logs every 2 seconds, we connect to
+  // /api/logs/stream which pushes new entries as they happen.
+  // This is:
+  //   - Instant (no 2s delay)
+  //   - Lower bandwidth (no repeated full history fetches)
+  //   - Lower server load (one connection, not a poll every 2s)
+  //
+  // When autoRefresh is ON, we connect to SSE. When OFF, we disconnect.
+  // ============================================================
+  const sseRef = useRef<EventSource | null>(null);
+  const [sseConnected, setSseConnected] = useState<boolean>(false);
+
   useEffect(() => {
-    if (!autoRefresh) return;
-    const interval = setInterval(() => {
-      if (document.visibilityState === "visible") {
-        fetchLogs();
+    if (!autoRefresh) {
+      // Disconnect SSE if it was open
+      if (sseRef.current) {
+        sseRef.current.close();
+        sseRef.current = null;
+        setSseConnected(false);
       }
-    }, 2000);
-    return () => clearInterval(interval);
-  }, [autoRefresh, fetchLogs]);
+      return;
+    }
+
+    // Connect to SSE
+    const eventSource = new EventSource("/api/logs/stream");
+    sseRef.current = eventSource;
+
+    eventSource.onopen = () => {
+      setSseConnected(true);
+    };
+
+    eventSource.onerror = () => {
+      setSseConnected(false);
+      // EventSource will auto-reconnect — we just update the UI state
+    };
+
+    eventSource.onmessage = (event) => {
+      try {
+        const entry: LogEntry = JSON.parse(event.data);
+        // Append the new entry to the list (cap at 500 visible entries)
+        setEntries((prev) => {
+          const combined = [...prev, entry];
+          if (combined.length > 500) {
+            return combined.slice(-500);
+          }
+          return combined;
+        });
+        setTotalEntries((prev) => prev + 1);
+        setLastFetch(new Date());
+      } catch {
+        // Ignore parse errors (heartbeats, etc.)
+      }
+    };
+
+    return () => {
+      eventSource.close();
+      sseRef.current = null;
+      setSseConnected(false);
+    };
+  }, [autoRefresh]); // NOTE: don't include levelFilter/debouncedSearch here —
+                     // SSE pushes ALL entries; filtering is done client-side.
+                     // We only re-connect when autoRefresh is toggled.
+
+  // When filters change, do a fresh fetch to get filtered history
+  useEffect(() => {
+    fetchLogs();
+  }, [fetchLogs]);
 
   // Auto-scroll to bottom when new entries arrive (only if user was at bottom)
   useEffect(() => {
@@ -444,10 +504,16 @@ function LogsContent() {
                 {lastFetch && (
                   <span>Updated {new Date(lastFetch).toLocaleTimeString(undefined, { hour12: false })}</span>
                 )}
-                {autoRefresh && (
+                {autoRefresh && sseConnected && (
                   <span className="flex items-center gap-1 text-emerald-400">
                     <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
-                    LIVE
+                    LIVE (SSE)
+                  </span>
+                )}
+                {autoRefresh && !sseConnected && (
+                  <span className="flex items-center gap-1 text-amber-400">
+                    <span className="w-1.5 h-1.5 rounded-full bg-amber-500 animate-pulse" />
+                    Connecting…
                   </span>
                 )}
               </div>

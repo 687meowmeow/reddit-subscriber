@@ -88,7 +88,11 @@ export function proxy(request: NextRequest) {
 // Backwards-compatible alias (some Next.js versions look for `middleware`)
 export { proxy as middleware };
 
-// Run on all routes (including API and static assets)
+// Run on all routes EXCEPT:
+//   - _next/static, _next/image, favicon.ico (static assets)
+//   - /api/logs/stream (SSE — long-lived connection, don't log every heartbeat)
+//     Logging the SSE connection creates noise in /logs because the
+//     connection stays open for the entire session.
 export const config = {
-  matcher: ["/((?!_next/static|_next/image|favicon.ico).*)"],
+  matcher: ["/((?!_next/static|_next/image|favicon.ico|api/logs/stream).*)"],
 };

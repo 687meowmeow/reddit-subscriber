@@ -47,6 +47,8 @@ const FETCH_SCRIPT = `
 import json
 import sys
 import os
+import shutil
+import subprocess
 import time
 from pathlib import Path
 
@@ -62,6 +64,46 @@ def log_diag(step, url, status, content_type, body_snippet, is_json, duration_ms
         "is_json": is_json,
         "duration_ms": duration_ms,
     })
+
+def find_display():
+    """Find an available X display — same logic as the main subscriber."""
+    display = os.environ.get("DISPLAY")
+    if display:
+        try:
+            subprocess.run(["xset", "q"], env={**os.environ, "DISPLAY": display},
+                          timeout=3, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+            return display, "existing DISPLAY env"
+        except Exception:
+            pass
+    for d in range(1, 6):
+        candidate = f":{d}"
+        try:
+            subprocess.run(["xset", "q"], env={**os.environ, "DISPLAY": candidate},
+                          timeout=3, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+            return candidate, f"VNC display {candidate}"
+        except Exception:
+            pass
+    xvfb = shutil.which("Xvfb")
+    if xvfb:
+        try:
+            subprocess.run(["pkill", "-f", "Xvfb :99"], timeout=2,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+        try:
+            subprocess.Popen([xvfb, ":99", "-screen", "0", "1920x1080x24", "-ac",
+                            "+extension", "RANDR"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            for _ in range(20):
+                try:
+                    subprocess.run(["xset", "q"], env={**os.environ, "DISPLAY": ":99"},
+                                  timeout=1, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+                    return ":99", "Xvfb :99 (started by helper)"
+                except Exception:
+                    time.sleep(0.2)
+        except Exception:
+            pass
+    return None, "headless (no display available)"
 
 try:
     from playwright.sync_api import sync_playwright
@@ -80,23 +122,26 @@ try:
         }))
         sys.exit(0)
 
-    # Try to import playwright-stealth (the main subscriber script uses this).
     stealth = None
     try:
         from playwright_stealth import Stealth
         stealth = Stealth()
     except ImportError:
-        log_diag("stealth_apply", "", 0, "",
-                 "playwright-stealth NOT installed — Reddit likely detects bot", False, 0)
+        log_diag("stealth_status", "", 0, "",
+                 "playwright-stealth NOT installed", False, 0)
+
+    display, display_method = find_display()
+    use_headless = display is None
+
+    log_diag("display_detection", "", 200 if display else 0, "",
+             f"display={display}, method={display_method}, headless={use_headless}",
+             False, 0)
+    log_diag("stealth_status", "", 200 if stealth else 0, "",
+             "playwright-stealth available" if stealth else "NOT installed", False, 0)
 
     subreddits = []
 
     with sync_playwright() as p:
-        # CRITICAL: same launch config as the main subscriber script.
-        #   - --disable-blink-features=AutomationControlled removes
-        #     navigator.webdriver=true
-        #   - playwright-stealth patches dozens of other bot signals
-        #   - java_script_enabled MUST be True — Reddit detects JS-disabled
         launch_args = [
             "--disable-blink-features=AutomationControlled",
             "--no-first-run",
@@ -104,7 +149,7 @@ try:
         ]
         browser = p.chromium.launch_persistent_context(
             user_data_dir=profile_dir,
-            headless=True,
+            headless=use_headless,
             args=launch_args,
             viewport={"width": 1280, "height": 800},
             locale="en-US",
@@ -116,20 +161,70 @@ try:
             try:
                 stealth.apply_stealth_sync(browser)
                 log_diag("stealth_apply", "", 200, "",
-                         "playwright-stealth applied successfully", False, 0)
+                         "playwright-stealth applied", False, 0)
             except Exception as exc:
                 log_diag("stealth_apply", "", 0, "",
                          f"stealth apply failed: {exc}", False, 0)
-        elif not diagnostics:
-            log_diag("stealth_apply", "", 0, "",
-                     "playwright-stealth NOT installed", False, 0)
 
         page = browser.new_page()
-        page.set_extra_http_headers({
-            "Accept": "application/json, text/plain, */*",
-            "Accept-Language": "en-US,en;q=0.9",
-        })
+        # NOTE: Do NOT set Accept: application/json header.
 
+        # --- STEP 1: Session warmup — navigate to reddit.com first ---
+        t0 = time.time()
+        try:
+            response = page.goto("https://www.reddit.com/",
+                               wait_until="domcontentloaded", timeout=30000)
+            warmup_status = response.status if response else 0
+            log_diag("session_warmup", "https://www.reddit.com/",
+                     warmup_status, "",
+                     f"navigated to reddit.com homepage",
+                     False, int((time.time() - t0) * 1000))
+        except Exception as exc:
+            log_diag("session_warmup", "https://www.reddit.com/", 0, "",
+                     f"navigation error: {exc}", False, int((time.time() - t0) * 1000))
+
+        # Check login state
+        try:
+            logged_in_check = page.evaluate("""
+                () => {
+                    const body = document.body ? document.body.innerHTML : '';
+                    const hasLoginButton = body.includes('Log In') || body.includes('"login"');
+                    const hasUserMenu = body.includes('user-drawer') ||
+                                       body.includes('"isLoggedIn":true');
+                    const isLoggedOutShell = body.includes('theme-beta') && body.includes('"isLoggedOut":true');
+                    return {
+                        hasLoginButton: hasLoginButton,
+                        hasUserMenu: hasUserMenu,
+                        isLoggedOutShell: isLoggedOutShell,
+                        url: window.location.href,
+                    };
+                }
+            """)
+            log_diag("login_check", "", 200, "text/html",
+                     f"hasLoginButton={logged_in_check.get('hasLoginButton')}, "
+                     f"hasUserMenu={logged_in_check.get('hasUserMenu')}, "
+                     f"isLoggedOutShell={logged_in_check.get('isLoggedOutShell')}",
+                     False, 0)
+
+            if logged_in_check.get("isLoggedOutShell"):
+                browser.close()
+                print(json.dumps({
+                    "ok": False,
+                    "error": (
+                        "Reddit shows the logged-out SPA shell. Your browser profile "
+                        "is NOT authenticated. Start a normal subscriber run, log in "
+                        "when prompted, wait for cookies to save, then try Sync again."
+                    ),
+                    "diagnostics": diagnostics,
+                }))
+                sys.exit(0)
+        except Exception as exc:
+            log_diag("login_check", "", 0, "",
+                     f"evaluate error: {exc}", False, 0)
+
+        page.wait_for_timeout(2000)
+
+        # --- STEP 2: Fetch /subreddits/mine/.json via page.evaluate(fetch()) ---
         after = ""
         page_count = 0
         max_pages = 50
@@ -142,85 +237,55 @@ try:
 
             t0 = time.time()
             try:
-                response = page.goto(url, wait_until="domcontentloaded", timeout=45000)
+                result = page.evaluate("""
+                    async (url) => {
+                        try {
+                            const res = await fetch(url, {
+                                credentials: 'include',
+                                headers: {'Accept': 'application/json'}
+                            });
+                            const status = res.status;
+                            const ct = res.headers.get('content-type') || '';
+                            const text = await res.text();
+                            return {status: status, contentType: ct, body: text};
+                        } catch (e) {
+                            return {status: 0, contentType: '', body: '', error: String(e)};
+                        }
+                    }
+                """, url)
             except Exception as exc:
-                log_diag(f"fetch_page_{page_count}", url, 0, "",
-                         f"navigation error: {exc}", False, int((time.time()-t0)*1000))
-                print(json.dumps({
-                    "ok": True,
-                    "subreddits": subreddits,
-                    "warning": f"Network error on page {page_count}: {exc}",
-                    "diagnostics": diagnostics,
-                }))
-                sys.exit(0)
+                result = {"status": 0, "contentType": "", "body": "",
+                         "error": f"evaluate error: {exc}"}
 
-            status = response.status if response else 0
-            content_type = ""
-            if response:
-                try:
-                    content_type = response.headers.get("content-type", "")
-                except Exception:
-                    pass
-
-            try:
-                body = response.text()
-            except Exception as exc:
-                log_diag(f"fetch_page_{page_count}", url, status, content_type,
-                         f"could not read body: {exc}", False, int((time.time()-t0)*1000))
-                browser.close()
-                print(json.dumps({
-                    "ok": False,
-                    "error": f"Could not read response body: {exc}",
-                    "diagnostics": diagnostics,
-                }))
-                sys.exit(0)
-
-            stripped = body.lstrip()[:200]
+            status = result.get("status", 0)
+            ct = result.get("contentType", "")
+            body = result.get("body", "")
+            stripped = body.lstrip()[:200] if body else ""
             is_json = stripped.startswith("{") or stripped.startswith("[")
+            snippet = (stripped or result.get("error", ""))[:200]
+
+            log_diag(f"fetch_page_{page_count}", url, status, ct,
+                     snippet, is_json, int((time.time() - t0) * 1000))
 
             if status == 401 or status == 403:
-                snippet = body.replace("\\n", " ").strip()[:160]
-                log_diag(f"fetch_page_{page_count}", url, status, content_type,
-                         snippet, is_json, int((time.time()-t0)*1000))
                 browser.close()
                 print(json.dumps({
                     "ok": False,
                     "error": (
-                        f"Reddit returned HTTP {status} — your browser profile "
-                        f"is not authenticated OR Reddit detected the browser as "
-                        f"a bot. Make sure playwright-stealth is installed "
-                        f"(pip install playwright-stealth) and you've logged in "
-                        f"via a normal subscriber run. Body snippet: {snippet}"
+                        f"Reddit returned HTTP {status} for subscriptions list "
+                        f"even after session warmup. Body: {snippet}"
                     ),
                     "diagnostics": diagnostics,
                 }))
                 sys.exit(0)
 
-            if status != 200:
-                snippet = body.replace("\\n", " ").strip()[:160]
-                log_diag(f"fetch_page_{page_count}", url, status, content_type,
-                         snippet, is_json, int((time.time()-t0)*1000))
+            if status != 200 or not is_json:
                 browser.close()
                 print(json.dumps({
                     "ok": False,
                     "error": (
-                        f"Reddit returned HTTP {status} when fetching the "
-                        f"subscriptions list. Body: {snippet}"
-                    ),
-                    "diagnostics": diagnostics,
-                }))
-                sys.exit(0)
-
-            if not is_json:
-                snippet = body.replace("\\n", " ").strip()[:160]
-                log_diag(f"fetch_page_{page_count}", url, status, content_type,
-                         snippet, False, int((time.time()-t0)*1000))
-                browser.close()
-                print(json.dumps({
-                    "ok": False,
-                    "error": (
-                        f"Reddit returned HTML instead of JSON. This usually "
-                        f"means you got rate-limited or logged out. Snippet: {snippet}"
+                        f"Reddit returned HTTP {status} ({'JSON' if is_json else 'HTML'}) "
+                        f"for subscriptions list. Body: {snippet}"
                     ),
                     "diagnostics": diagnostics,
                 }))
@@ -228,11 +293,7 @@ try:
 
             try:
                 data = json.loads(body)
-                log_diag(f"fetch_page_{page_count}", url, status, content_type,
-                         stripped[:200], True, int((time.time()-t0)*1000))
             except Exception as exc:
-                log_diag(f"fetch_page_{page_count}", url, status, content_type,
-                         f"json parse failed: {exc}", False, int((time.time()-t0)*1000))
                 browser.close()
                 print(json.dumps({
                     "ok": False,
@@ -276,6 +337,8 @@ try:
         "ok": True,
         "subreddits": subreddits,
         "diagnostics": diagnostics,
+        "display_used": display or "headless",
+        "display_method": display_method,
     }))
 
 except Exception as e:
