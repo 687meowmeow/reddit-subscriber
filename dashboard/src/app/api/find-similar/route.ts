@@ -93,6 +93,16 @@ interface SimilarSubreddit {
   url: string;
 }
 
+interface DiagnosticEntry {
+  step: string;
+  url: string;
+  status: number;
+  content_type?: string;
+  body_snippet: string;
+  is_json: boolean;
+  duration_ms: number;
+}
+
 interface HelperResult {
   ok: boolean;
   subreddit?: string;
@@ -114,6 +124,7 @@ interface HelperResult {
     url: string;
   }>;
   queries_used?: string[];
+  diagnostics?: DiagnosticEntry[];
   error?: string;
 }
 
@@ -299,14 +310,59 @@ export async function POST(request: NextRequest) {
 
   const keywords = helperResult.keywords || [];
   const rawResults = helperResult.search_results || [];
+  const diagnostics = helperResult.diagnostics || [];
 
-  logger.info("Python helper succeeded", {
-    subreddit: cleanName,
-    keywords,
-    raw_results_count: rawResults.length,
-    queries_used: helperResult.queries_used,
-    duration_ms: Date.now() - startTime,
-  }, routeName);
+  // Log diagnostics at DEBUG level so they're available in /logs when
+  // the user filters to DEBUG level. Each entry shows: step, url, status,
+  // content-type, body snippet, is_json, duration.
+  if (diagnostics.length > 0) {
+    logger.debug("Python helper diagnostics (one entry per HTTP request)", {
+      subreddit: cleanName,
+      diagnostics_count: diagnostics.length,
+      diagnostics_summary: diagnostics.map(d => ({
+        step: d.step,
+        status: d.status,
+        is_json: d.is_json,
+        content_type: (d.content_type || "").slice(0, 60),
+        body_snippet: d.body_snippet.slice(0, 120),
+      })),
+    }, routeName);
+  }
+
+  if (rawResults.length === 0) {
+    // Helpful warning — surface the most likely reason in the logs.
+    // Look at the diagnostics to figure out what happened.
+    const aboutDiag = diagnostics.find(d => d.step === "fetch_about");
+    const searchDiags = diagnostics.filter(d => d.step.startsWith("search_"));
+    const stealthDiag = diagnostics.find(d => d.step === "stealth_apply");
+    let reason = "unknown";
+    if (stealthDiag && stealthDiag.body_snippet.includes("NOT installed")) {
+      reason = "playwright-stealth not installed — Reddit likely detected the browser as a bot and 403'd the search endpoint. Run: pip install playwright-stealth";
+    } else if (aboutDiag && (aboutDiag.status === 403 || aboutDiag.status === 401)) {
+      reason = "about.json returned 401/403 — browser profile not authenticated";
+    } else if (searchDiags.length > 0 && searchDiags.every(d => !d.is_json)) {
+      reason = "all search endpoints returned non-JSON (likely 403 block page). Reddit may be detecting the browser as a bot even with stealth.";
+    } else if (searchDiags.length === 0) {
+      reason = "no search requests were made — internal helper error";
+    } else if (searchDiags.every(d => d.status === 200 && d.is_json)) {
+      reason = "search returned 200 JSON but no children — keywords may not match any subreddits, or Reddit's search is returning empty results";
+    }
+    logger.warn("Find Similar returned 0 results — see diagnostics", {
+      subreddit: cleanName,
+      keywords,
+      reason,
+      diagnostics_count: diagnostics.length,
+      search_requests_made: searchDiags.length,
+    }, routeName);
+  } else {
+    logger.info("Python helper succeeded", {
+      subreddit: cleanName,
+      keywords,
+      raw_results_count: rawResults.length,
+      queries_used: helperResult.queries_used,
+      duration_ms: Date.now() - startTime,
+    }, routeName);
+  }
 
   // Score and filter results
   const results: SimilarSubreddit[] = [];
@@ -375,5 +431,9 @@ export async function POST(request: NextRequest) {
     results: topResults,
     total_found: results.length,
     queries_used: helperResult.queries_used || [],
+    // Include diagnostics so the /find-similar page can show what
+    // Reddit returned (status codes, body snippets) when results are
+    // empty. This makes debugging from the UI possible.
+    diagnostics: diagnostics.slice(0, 20), // cap at 20 to keep response small
   });
 }

@@ -45,6 +45,16 @@ function formatNumber(n: string | number | undefined): string {
   return num.toString();
 }
 
+interface DiagnosticEntry {
+  step: string;
+  url: string;
+  status: number;
+  content_type?: string;
+  body_snippet: string;
+  is_json: boolean;
+  duration_ms: number;
+}
+
 interface SimilarSubreddit {
   name: string;
   display_name: string;
@@ -71,6 +81,7 @@ function FindSimilarContent() {
   const [keywords, setKeywords] = useState<string[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [csvName, setCsvName] = useState<string>(initialCsv);
+  const [diagnostics, setDiagnostics] = useState<DiagnosticEntry[]>([]);
 
   // Sort / filter state
   const [sortBy, setSortBy] = useState<"relevance" | "subscribers">("relevance");
@@ -101,6 +112,7 @@ function FindSimilarContent() {
     setError(null);
     setResults([]);
     setKeywords([]);
+    setDiagnostics([]);
     setSearchedFor(trimmed);
     try {
       const res = await fetch("/api/find-similar", {
@@ -111,9 +123,13 @@ function FindSimilarContent() {
       const data = await res.json();
       if (!res.ok) {
         setError(data.error || `HTTP ${res.status}`);
+        // Even on error, the API may include diagnostics showing
+        // what Reddit returned (helpful for debugging auth issues).
+        if (data.diagnostics) setDiagnostics(data.diagnostics);
       } else {
         setResults(data.results || []);
         setKeywords(data.keywords || []);
+        if (data.diagnostics) setDiagnostics(data.diagnostics);
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -418,16 +434,84 @@ function FindSimilarContent() {
           </Card>
         )}
 
-        {/* Empty state */}
+        {/* Empty state — with diagnostics when available */}
         {!loading && !error && searchedFor && results.length === 0 && (
           <Card>
-            <CardContent className="pt-12 pb-12 text-center text-slate-500">
-              <Search className="w-10 h-10 mx-auto mb-3 opacity-30" />
-              <p className="font-medium">No similar subreddits found for r/{searchedFor}</p>
-              <p className="text-xs mt-1">
-                Try a different name, or check your spelling. Subreddits with fewer
-                than 100 subscribers are filtered out.
-              </p>
+            <CardContent className="pt-6 pb-6">
+              <div className="text-center text-slate-500 mb-4">
+                <Search className="w-10 h-10 mx-auto mb-3 opacity-30" />
+                <p className="font-medium">No similar subreddits found for r/{searchedFor}</p>
+                <p className="text-xs mt-1">
+                  Check the diagnostics below — they show what Reddit returned for each request.
+                  If you see 403 statuses, your browser profile may not be authenticated, or
+                  Reddit detected the bot. Try running a normal subscriber session first so the
+                  browser profile saves fresh cookies.
+                </p>
+              </div>
+
+              {/* Diagnostics — show what each HTTP request returned */}
+              {diagnostics.length > 0 && (
+                <div className="mt-4 border-t border-slate-200 dark:border-slate-800 pt-4">
+                  <p className="text-xs font-semibold text-slate-700 dark:text-slate-300 mb-2">
+                    Diagnostics ({diagnostics.length} HTTP requests made):
+                  </p>
+                  <div className="space-y-2 max-h-[400px] overflow-auto">
+                    {diagnostics.map((d, i) => (
+                      <div
+                        key={i}
+                        className={cn(
+                          "p-2 rounded border text-xs font-mono",
+                          d.is_json
+                            ? "bg-emerald-50 dark:bg-emerald-950/30 border-emerald-200 dark:border-emerald-800"
+                            : d.status === 403 || d.status === 401
+                            ? "bg-red-50 dark:bg-red-950/30 border-red-200 dark:border-red-800"
+                            : "bg-amber-50 dark:bg-amber-950/30 border-amber-200 dark:border-amber-800"
+                        )}
+                      >
+                        <div className="flex items-center gap-2 flex-wrap">
+                          <span className="font-bold">{d.step}</span>
+                          <Badge
+                            variant="outline"
+                            className={cn(
+                              "text-[10px] py-0 px-1.5",
+                              d.status === 200
+                                ? "border-emerald-300 text-emerald-700 dark:border-emerald-700 dark:text-emerald-300"
+                                : d.status === 403 || d.status === 401
+                                ? "border-red-300 text-red-700 dark:border-red-700 dark:text-red-300"
+                                : "border-amber-300 text-amber-700 dark:border-amber-700 dark:text-amber-300"
+                            )}
+                          >
+                            HTTP {d.status}
+                          </Badge>
+                          {d.is_json ? (
+                            <Badge variant="outline" className="text-[10px] py-0 px-1.5 border-emerald-300 text-emerald-700 dark:border-emerald-700 dark:text-emerald-300">
+                              JSON
+                            </Badge>
+                          ) : (
+                            <Badge variant="outline" className="text-[10px] py-0 px-1.5 border-amber-300 text-amber-700 dark:border-amber-700 dark:text-amber-300">
+                              HTML
+                            </Badge>
+                          )}
+                          {d.duration_ms > 0 && (
+                            <span className="text-slate-500">{d.duration_ms}ms</span>
+                          )}
+                        </div>
+                        {d.url && (
+                          <p className="text-slate-500 mt-1 break-all">URL: {d.url}</p>
+                        )}
+                        {d.body_snippet && (
+                          <p className="text-slate-600 dark:text-slate-400 mt-1 break-all">
+                            Body: {d.body_snippet.slice(0, 200)}
+                          </p>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                  <p className="text-[10px] text-slate-500 mt-3">
+                    Full diagnostics are also logged to the <button onClick={() => router.push('/logs')} className="text-blue-600 dark:text-blue-400 underline">server logs</button> at DEBUG level.
+                  </p>
+                </div>
+              )}
             </CardContent>
           </Card>
         )}

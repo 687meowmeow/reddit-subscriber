@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { promises as fs } from "fs";
 import path from "path";
 import fsSync from "fs";
+import logger from "@/lib/logger";
 
 // ============================================================
 // Add a new subreddit row to the CSV file.
@@ -43,13 +44,26 @@ function escapeCsvField(value: string): string {
 }
 
 export async function POST(request: NextRequest) {
+  const start = Date.now();
+  const routeName = "POST /api/csv-add-row";
+
   try {
     const body = await request.json().catch(() => ({}));
     const csvParam = body.csv;
     const subredditName = (body.subreddit || "").trim();
     const status = body.status || "pending";
 
+    logger.info("CSV add-row request", {
+      csv: csvParam,
+      subreddit: subredditName,
+      status,
+    }, routeName);
+
     if (!csvParam || !subredditName) {
+      logger.warn("CSV add-row rejected — missing fields", {
+        csv: csvParam,
+        subreddit: subredditName,
+      }, routeName);
       return NextResponse.json(
         { error: "Missing required fields: csv, subreddit" },
         { status: 400 }
@@ -62,6 +76,10 @@ export async function POST(request: NextRequest) {
       : path.resolve(csvRoot, csvParam);
 
     if (!fsSync.existsSync(resolvedPath)) {
+      logger.warn("CSV add-row rejected — file not found", {
+        csv: csvParam,
+        resolvedPath,
+      }, routeName);
       return NextResponse.json(
         { error: `CSV file not found: ${resolvedPath}` },
         { status: 404 }
@@ -73,6 +91,7 @@ export async function POST(request: NextRequest) {
     const lines = text.split("\n").filter((l) => l.trim());
 
     if (lines.length === 0) {
+      logger.warn("CSV add-row rejected — CSV is empty", { csv: csvParam }, routeName);
       return NextResponse.json(
         { error: "CSV is empty" },
         { status: 400 }
@@ -129,8 +148,11 @@ export async function POST(request: NextRequest) {
     }
 
     if (foundIdx >= 0) {
-      // Row exists — update its status using csv-update-row logic
-      // For simplicity, just append a note and return
+      logger.info("CSV add-row — subreddit already exists, skipping", {
+        csv: csvParam,
+        subreddit: cleanName,
+        foundAtRow: foundIdx,
+      }, routeName);
       return NextResponse.json({
         ok: true,
         message: `r/${cleanName} is already in the CSV (row ${foundIdx})`,
@@ -138,13 +160,19 @@ export async function POST(request: NextRequest) {
       });
     }
 
-    // Build the new row
+    // Build the new row.
+    // If the CSV has a first_seen_at column, populate it with the current
+    // timestamp so the row shows up with a "NEW" badge in the dashboard
+    // for 24 hours (matching the auto-sync behavior).
+    const nowIso = new Date().toISOString();
     const newRow = fieldnames.map((fn) => {
       const lower = fn.toLowerCase();
       if (lower === "subreddit" || lower === "subreddit_name" || lower === "sub" || lower === "name" || lower === "sr") {
         return cleanName;
       }
       if (lower === "status") return status;
+      if (lower === "first_seen_at") return nowIso;
+      if (lower === "subscribed_at") return nowIso;
       return "";
     });
 
@@ -152,6 +180,14 @@ export async function POST(request: NextRequest) {
     const newLine = newRow.map(escapeCsvField).join(",");
     const newText = text.endsWith("\n") ? text + newLine + "\n" : text + "\n" + newLine + "\n";
     await fs.writeFile(resolvedPath, newText, "utf-8");
+
+    const durationMs = Date.now() - start;
+    logger.info("CSV add-row — appended new row", {
+      csv: csvParam,
+      subreddit: cleanName,
+      status,
+      durationMs,
+    }, routeName);
 
     return NextResponse.json({
       ok: true,
@@ -161,6 +197,7 @@ export async function POST(request: NextRequest) {
     });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
+    logger.error("CSV add-row failed", { error: message }, routeName, err instanceof Error ? err.stack : undefined);
     return NextResponse.json(
       { error: `Failed to add row: ${message}` },
       { status: 500 }

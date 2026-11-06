@@ -471,6 +471,106 @@ export default function Home() {
     }
   }, [selectedCsv, fetchCsvData]);
 
+  // ============================================================
+  // AUTO-SYNC — silent background sync.
+  //
+  // Every 5 minutes when the dashboard is open AND a CSV is selected,
+  // we silently call /api/sync-subscriptions in the background. If new
+  // subs are detected (subs the user joined manually on Reddit that
+  // aren't in the CSV yet), they get added as "pending" + a
+  // first_seen_at timestamp. We show a small toast-style notification
+  // banner so the user knows it happened.
+  //
+  // The auto-sync uses a SEPARATE state from the manual Sync button
+  // so it doesn't trigger the spinner UI.
+  // ============================================================
+  const [lastAutoSync, setLastAutoSync] = useState<Date | null>(null);
+  const [autoSyncResult, setAutoSyncResult] = useState<{
+    added: number;
+    added_names: string[];
+    timestamp: Date;
+  } | null>(null);
+  const autoSyncInProgressRef = useRef<boolean>(false);
+
+  const runAutoSync = useCallback(async () => {
+    // Don't run if:
+    //   - No CSV is selected
+    //   - A manual sync is already in progress (avoid concurrent runs)
+    //   - An auto-sync is already in progress
+    //   - The dashboard tab is hidden (browser throttles anyway, but
+    //     we also don't want to waste Pi CPU when no one is looking)
+    if (!selectedCsv) return;
+    if (syncing) return;
+    if (autoSyncInProgressRef.current) return;
+    if (typeof document !== "undefined" && document.visibilityState !== "visible") return;
+
+    autoSyncInProgressRef.current = true;
+    try {
+      const res = await fetch("/api/sync-subscriptions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ csv: selectedCsv }),
+      });
+      const data = await res.json();
+      setLastAutoSync(new Date());
+
+      if (data.ok && data.added > 0) {
+        // New subs detected! Show a notification banner.
+        setAutoSyncResult({
+          added: data.added,
+          added_names: data.added_names || [],
+          timestamp: new Date(),
+        });
+        // Auto-dismiss after 60 seconds
+        setTimeout(() => setAutoSyncResult(null), 60000);
+        // Refresh the CSV so the new rows show up immediately
+        fetchCsvData(selectedCsv);
+      }
+      // If added === 0, do nothing — silent success. We don't want to
+      // bother the user every 5 minutes with "no new subs found".
+    } catch (err) {
+      // Silent failure — don't disrupt the UI. The error will show up
+      // in the server logs (/logs page) for debugging.
+      console.warn("Auto-sync failed:", err);
+    } finally {
+      autoSyncInProgressRef.current = false;
+    }
+  }, [selectedCsv, syncing, fetchCsvData]);
+
+  // Run auto-sync every 5 minutes when the dashboard is open
+  useEffect(() => {
+    if (!selectedCsv) return;
+    // Initial sync 30 seconds after the dashboard loads (gives the
+    // user time to see the dashboard before we start fetching)
+    const initialTimer = setTimeout(() => {
+      runAutoSync();
+    }, 30000);
+
+    // Then every 5 minutes
+    const interval = setInterval(() => {
+      if (document.visibilityState === "visible") {
+        runAutoSync();
+      }
+    }, 5 * 60 * 1000); // 5 minutes
+
+    // Also kick an auto-sync when the tab becomes visible again
+    // (the user may have joined subs on Reddit in another tab)
+    const handleVisibility = () => {
+      if (document.visibilityState === "visible") {
+        // Wait 3 seconds before syncing so the regular CSV refresh
+        // has time to complete first
+        setTimeout(() => runAutoSync(), 3000);
+      }
+    };
+    document.addEventListener("visibilitychange", handleVisibility);
+
+    return () => {
+      clearTimeout(initialTimer);
+      clearInterval(interval);
+      document.removeEventListener("visibilitychange", handleVisibility);
+    };
+  }, [selectedCsv, runAutoSync]);
+
   const handleFileUpload = useCallback(async (file: File) => {
     setUploading(true);
     setUploadResult(null);
@@ -1255,6 +1355,39 @@ export default function Home() {
           </Card>
         )}
 
+        {/* Auto-sync notification banner — shows when the background
+            sync detects new subreddits the user joined on Reddit. */}
+        {autoSyncResult && (
+          <Card className="border-emerald-300 dark:border-emerald-700 bg-emerald-50 dark:bg-emerald-950/30">
+            <CardContent className="pt-4 pb-4">
+              <div className="flex items-start gap-3">
+                <CheckCircle2 className="w-5 h-5 text-emerald-600 dark:text-emerald-400 flex-shrink-0 mt-0.5" />
+                <div className="flex-1 min-w-0">
+                  <p className="font-semibold text-emerald-700 dark:text-emerald-300">
+                    Auto-detected {autoSyncResult.added} new subreddit{autoSyncResult.added === 1 ? "" : "s"} you joined on Reddit
+                  </p>
+                  <p className="text-xs text-emerald-700 dark:text-emerald-400 mt-1 break-words">
+                    Added as <strong>pending</strong>: {autoSyncResult.added_names.join(", ")}
+                    {autoSyncResult.added_names.length < autoSyncResult.added && ` ...and ${autoSyncResult.added - autoSyncResult.added_names.length} more`}
+                  </p>
+                  <p className="text-[10px] text-slate-500 mt-1">
+                    Detected at {autoSyncResult.timestamp.toLocaleTimeString(undefined, { hour12: false })}
+                    {" · "}Next auto-sync in 5 minutes
+                  </p>
+                </div>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => setAutoSyncResult(null)}
+                  className="text-emerald-700 dark:text-emerald-400"
+                >
+                  Dismiss
+                </Button>
+              </div>
+            </CardContent>
+          </Card>
+        )}
+
 
         {/* List error display */}
         {listError && (
@@ -1663,11 +1796,27 @@ export default function Home() {
                           const hasError = !!row.error;
                           const iconUrl = row.icon_url;
                           const error = row.error || "";
+                          // "New" badge — show for subs added to the CSV in the
+                          // last 24 hours (via auto-sync or manual add). Uses
+                          // the first_seen_at column that sync-subscriptions
+                          // writes. If the column doesn't exist, no badge.
+                          const firstSeenAt = row.first_seen_at || "";
+                          let isNew = false;
+                          if (firstSeenAt) {
+                            try {
+                              const seen = new Date(firstSeenAt).getTime();
+                              const ageMs = Date.now() - seen;
+                              isNew = ageMs >= 0 && ageMs < 24 * 60 * 60 * 1000; // < 24h
+                            } catch {}
+                          }
 
                           return (
                             <tr
                               key={`${name}-${idx}`}
-                              className="border-b border-slate-100 dark:border-slate-900 hover:bg-slate-50 dark:hover:bg-slate-900/50 group"
+                              className={cn(
+                                "border-b border-slate-100 dark:border-slate-900 hover:bg-slate-50 dark:hover:bg-slate-900/50 group",
+                                isNew && "bg-blue-50/40 dark:bg-blue-950/20"
+                              )}
                             >
                               {/* Name */}
                               <td className="px-4 py-3">
@@ -1696,11 +1845,18 @@ export default function Home() {
                                       r/{name}
                                       <ExternalLink className="w-3 h-3 opacity-0 group-hover:opacity-100 transition-opacity" />
                                     </a>
-                                    {nsfw && (
-                                      <Badge variant="outline" className="text-[10px] py-0 px-1.5 w-fit border-rose-300 text-rose-700 dark:border-rose-700 dark:text-rose-300">
-                                        NSFW
-                                      </Badge>
-                                    )}
+                                    <div className="flex items-center gap-1.5 flex-wrap">
+                                      {nsfw && (
+                                        <Badge variant="outline" className="text-[10px] py-0 px-1.5 w-fit border-rose-300 text-rose-700 dark:border-rose-700 dark:text-rose-300">
+                                          NSFW
+                                        </Badge>
+                                      )}
+                                      {isNew && (
+                                        <Badge variant="outline" className="text-[10px] py-0 px-1.5 w-fit border-blue-400 text-blue-700 dark:border-blue-600 dark:text-blue-300 bg-blue-100 dark:bg-blue-950/40 animate-pulse">
+                                          NEW
+                                        </Badge>
+                                      )}
+                                    </div>
                                   </div>
                                 </div>
                               </td>
@@ -1893,6 +2049,14 @@ export default function Home() {
           </div>
           <div className="flex items-center gap-2">
             <span>Drops to <code className="font-mono px-1 py-0.5 rounded bg-slate-100 dark:bg-slate-800">/api/csv-data</code> every 5s</span>
+            {lastAutoSync && (
+              <>
+                <span>·</span>
+                <span title="Background sync runs every 5 minutes to auto-detect subs you joined on Reddit">
+                  Auto-sync: {formatRelativeTime(lastAutoSync.toISOString())}
+                </span>
+              </>
+            )}
           </div>
         </div>
       </footer>
